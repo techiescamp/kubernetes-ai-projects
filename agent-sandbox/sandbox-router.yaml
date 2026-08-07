@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-router-svc
+  namespace: agent-sandbox-system
+spec:
+  type: ClusterIP
+  selector:
+    app: sandbox-router
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8080
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-router-deployment
+  namespace: agent-sandbox-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sandbox-router
+  template:
+    metadata:
+      labels:
+        app: sandbox-router
+    spec:
+      containers:
+      - name: router
+        image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandbox-router:latest-main
+        env:
+        - name: PROXY_TIMEOUT_SECONDS
+          value: "180"
+        - name: WEBSOCKET_IDLE_TIMEOUT_SECONDS
+          value: "3600"
+        - name: WEBSOCKET_MAX_LIFETIME_SECONDS
+          value: "86400"
+        - name: WEBSOCKET_MAX_MESSAGE_BYTES
+          value: "16777216"
+        - name: WEBSOCKET_MAX_CONNECTIONS_PER_CLIENT
+          value: "0"
+        - name: ROUTER_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: sandbox-router-auth
+              key: auth-token
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
