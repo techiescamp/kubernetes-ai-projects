@@ -1,6 +1,8 @@
 import os
 from collections import defaultdict
 
+from metrics import LLM_TOKENS
+
 
 def _price(env_var: str) -> float:
     """Reads an optional $/1K-token price from the environment. Blank or unset -> 0 (no cost estimate)."""
@@ -33,9 +35,13 @@ def record_usage(role: str, response) -> None:
     if not meta:
         return
     entry = _usage[role]
-    entry["input_tokens"] += meta.get("input_tokens", 0) or 0
-    entry["output_tokens"] += meta.get("output_tokens", 0) or 0
+    input_tokens = meta.get("input_tokens", 0) or 0
+    output_tokens = meta.get("output_tokens", 0) or 0
+    entry["input_tokens"] += input_tokens
+    entry["output_tokens"] += output_tokens
     entry["calls"] += 1
+    LLM_TOKENS.labels(role=role, direction="input").inc(input_tokens)
+    LLM_TOKENS.labels(role=role, direction="output").inc(output_tokens)
 
 
 def get_summary() -> str:

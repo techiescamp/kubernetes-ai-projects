@@ -41,4 +41,3 @@ def get_remediation_model():
         temperature=0.2,
     )
 
-

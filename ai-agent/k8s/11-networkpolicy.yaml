@@ -1,0 +1,62 @@
+# Default-deny-by-omission NetworkPolicy for the backend: only the frontend can reach it, and it
+# can only reach the Kubernetes API server, Postgres, AWS Bedrock (HTTPS egress), and DNS.
+# Borrows the "granular authorization" / "auditable traffic" principles from
+# https://kube-agentic-networking.sigs.k8s.io/ using core NetworkPolicy rather than that
+# proposal's (not-yet-stable) Gateway API CRDs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-agent-backend
+  namespace: ai-agent
+spec:
+  podSelector:
+    matchLabels: {app: ai-agent-backend}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: ai-agent-frontend}}
+      ports:
+        - {port: 8000, protocol: TCP}
+  egress:
+    # Kubernetes API server - no in-cluster podSelector target exists for it, so this allows all
+    # egress on 443; tighten to your cluster's actual API server CIDR if you want it narrower.
+    - ports: [{port: 443, protocol: TCP}]
+    - to:
+        - podSelector: {matchLabels: {app: ai-agent-postgres}}
+      ports: [{port: 5432, protocol: TCP}]
+    - ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-agent-frontend
+  namespace: ai-agent
+spec:
+  podSelector:
+    matchLabels: {app: ai-agent-frontend}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - {} # allow from anywhere in-cluster (an Ingress controller typically lives outside this namespace)
+  egress:
+    - to:
+        - podSelector: {matchLabels: {app: ai-agent-backend}}
+      ports: [{port: 8000, protocol: TCP}]
+    - ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-agent-postgres
+  namespace: ai-agent
+spec:
+  podSelector:
+    matchLabels: {app: ai-agent-postgres}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: ai-agent-backend}}
+      ports: [{port: 5432, protocol: TCP}]

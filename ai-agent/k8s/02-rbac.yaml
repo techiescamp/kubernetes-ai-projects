@@ -1,0 +1,93 @@
+# Least-privilege (within a documented boundary) RBAC for the agent's expanded tool set in
+# k8s_tools.py. Split into read (get/list/watch) rules matching the diagnostic tools, and write
+# rules matching exactly what the remediation tools do.
+#
+# apply_kubernetes_yaml/delete_resource support a curated set of common workload kinds only
+# (matches k8s_tools.py's _ALLOWED_KINDS). This ClusterRole deliberately EXCLUDES:
+#   - rbac.authorization.k8s.io (Roles/ClusterRoles/Bindings) - so the agent can never grant
+#     itself (or anything else) more permissions than it already has.
+#   - write access to Secrets - the agent can list Secret names/keys for troubleshooting
+#     (k8s_tools.list_secrets never reads .data/.stringData) but can never create, update, or
+#     read secret VALUES.
+#
+# The real safety gate against misuse isn't RBAC alone - it's the human-approval interrupt in
+# agents.py (interrupt_before=["apply_remediation", "propose_retry"]): no write action listed
+# here ever runs without a person approving it via POST /api/decision first. RBAC is the backstop
+# that bounds what an approved action is even capable of doing.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ai-agent
+rules:
+  # --- Read-only: diagnostics/verification tools ---
+  - apiGroups: [""]
+    resources:
+      - namespaces
+      - services
+      - configmaps
+      - persistentvolumeclaims
+      - persistentvolumes
+      - nodes
+      - events
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"] # names/keys/type only - k8s_tools.list_secrets never returns values
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+
+  # --- Write: remediation tools (restart_pod, update_pod_image, scale_deployment, etc.) ---
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create"] # deliberately no "delete" - deleting a namespace cascades to everything in
+                       # it; delete_resource's code path allows attempting it, but RBAC is the
+                       # backstop that blocks it regardless of what gets approved
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["update", "patch"]
+
+  # --- Write: apply_kubernetes_yaml / delete_resource, curated kinds only (see header) ---
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "persistentvolumeclaims"]
+    verbs: ["create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ai-agent
+subjects:
+  - kind: ServiceAccount
+    name: ai-agent
+    namespace: ai-agent
+roleRef:
+  kind: ClusterRole
+  name: ai-agent
+  apiGroup: rbac.authorization.k8s.io

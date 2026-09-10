@@ -1,15 +1,24 @@
+import logging
+import os
 from typing import TypedDict, List, Annotated, Dict, Any
 import operator
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+from checkpointer import build_checkpointer
 from bedrock_clients import get_diagnostics_model, get_remediation_model
 from usage_tracker import record_usage
+from metrics import record_tool_call, GRAPH_NODE_SECONDS, REMEDIATION_OUTCOMES
 from k8s_tools import (
     list_namespaces, get_pod_status, get_pod_logs, get_pod_events, describe_pod,
+    get_cluster_events, list_nodes, describe_node, list_deployments, describe_deployment,
+    list_replicasets, list_services, list_ingresses, list_configmaps, list_secrets,
+    list_pvcs, list_jobs, list_cronjobs, list_statefulsets, list_daemonsets, list_hpas,
+    get_resource_usage,
     restart_pod, scale_deployment, apply_kubernetes_yaml, create_namespace, create_pod,
-    update_pod_image
+    update_pod_image, patch_deployment_image, rollout_restart_deployment, delete_resource,
 )
+
+logger = logging.getLogger(__name__)
 
 # 1. State Definition
 class AgentState(TypedDict):
@@ -22,15 +31,34 @@ class AgentState(TypedDict):
     verification_result: str
     attempt: int
 
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = int(os.getenv("MAX_REMEDIATION_ATTEMPTS", "3"))
 
 # 2. Bind Tools to ChatModels
-diag_tools = [list_namespaces, get_pod_status, get_pod_logs, get_pod_events, describe_pod]
-remedy_tools = [restart_pod, update_pod_image, scale_deployment, apply_kubernetes_yaml, create_namespace, create_pod]
+diag_tools = [
+    list_namespaces, get_pod_status, get_pod_logs, get_pod_events, describe_pod,
+    get_cluster_events, list_nodes, describe_node, list_deployments, describe_deployment,
+    list_replicasets, list_services, list_ingresses, list_configmaps, list_secrets,
+    list_pvcs, list_jobs, list_cronjobs, list_statefulsets, list_daemonsets, list_hpas,
+    get_resource_usage,
+]
+remedy_tools = [
+    restart_pod, update_pod_image, patch_deployment_image, rollout_restart_deployment,
+    scale_deployment, apply_kubernetes_yaml, create_namespace, create_pod, delete_resource,
+]
 
 # Map tool names to tool functions for execution
 diag_tool_map = {t.name: t for t in diag_tools}
 remedy_tool_map = {t.name: t for t in remedy_tools}
+
+def _timed_node(node_name: str):
+    """Decorator that records a LangGraph node's execution duration in GRAPH_NODE_SECONDS."""
+    def decorator(func):
+        def wrapper(state):
+            with GRAPH_NODE_SECONDS.labels(node=node_name).time():
+                return func(state)
+        return wrapper
+    return decorator
+
 
 def clean_message_content(content) -> str:
     """Helper to convert complex message content structures (e.g. block lists) to clean raw strings."""
@@ -51,6 +79,7 @@ def clean_message_content(content) -> str:
 
 # 3. Define Nodes
 
+@_timed_node("diagnose")
 def diagnose_node(state: AgentState) -> Dict[str, Any]:
     """
     Nova Pro model node.
@@ -82,6 +111,7 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
             "   e. Your report must state the EXACT error message, exit code, or reason found in the tool output (quote it), not a hypothetical list of possible causes. Only say the cause is uncertain if the tools genuinely returned no useful evidence after trying (a)-(d).\n"
             "3. If the user is reporting a fault/issue, requesting a modification/creation (e.g. creating a namespace, creating a pod, restarting resources, scaling), or if you detect a failing resource, describe EXACTLY what needs to be changed or created, including any resource names/values the user gave you verbatim (e.g. namespace name, pod name, container image, replica count, deployment name). If the user wants a pod created but did not specify a container image, pick a sensible default (e.g. 'nginx:latest') and state it explicitly so the Remediation Agent doesn't have to guess. Do not try to apply modifications yourself (as you only have read-only tools). Summarize the requested change in your own report and output 'REMEDIATION_NEEDED: YES' so the Remediation Agent can apply it.\n"
             "   Match the fix to the ROOT CAUSE, don't default to restarting: if the container state/reason is ImagePullBackOff, ErrImagePull, or InvalidImageName, the fix is to correct the image (state the exact correct image string), NOT to restart/delete the pod - the error is baked into the pod spec and deleting it just fails again the same way (or, if describe_pod shows 'standalone_pod: true' i.e. no owner_references, deleting it PERMANENTLY removes it since nothing recreates it). Only recommend a restart for genuinely transient failures (e.g. a one-off crash where the spec itself is correct).\n"
+            "   If describe_pod shows the pod IS owned by a Deployment (owner_references contains a ReplicaSet whose own owner is a Deployment), prefer the Deployment-level tools (patch_deployment_image, rollout_restart_deployment) over the pod-level ones (update_pod_image, restart_pod) - a direct pod-level fix gets overwritten the next time the Deployment's controller reconciles, so it doesn't actually stick. State the Deployment's name (not just the pod's) in that case.\n"
             "4. Crucial: At the very end of your final response, append exactly one of the following lines:\n"
             "   - 'REMEDIATION_NEEDED: YES' (if the user requested a modification/creation, or if there is an active failure/configuration error that requires a write action)\n"
             "   - 'REMEDIATION_NEEDED: NO' (if it's a read-only query, or if all resources are healthy and no changes are needed)\n"
@@ -101,8 +131,9 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
             for tc in response.tool_calls:
                 tool_func = diag_tool_map.get(tc["name"])
                 if tool_func:
-                    print(f"\n[Diagnostics Agent] Calling tool '{tc['name']}' with args: {tc['args']}")
+                    logger.info(f"tool_call diagnostics {tc['name']} args={tc['args']}")
                     result = tool_func.invoke(tc["args"])
+                    record_tool_call(tc["name"], result)
                     curr_messages.append(HumanMessage(
                         content=str(result),
                         name=tc["name"],
@@ -128,6 +159,7 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
         "diagnostic_report": full_report
     }
 
+@_timed_node("propose_remediation")
 def propose_remediation_node(state: AgentState) -> Dict[str, Any]:
     """
     Llama model node (Propose Fix).
@@ -142,7 +174,7 @@ def propose_remediation_node(state: AgentState) -> Dict[str, Any]:
         f"Instructions:\n"
         f"1. Be concrete and specific to THIS report only - do not write generic/hypothetical Kubernetes advice or invent scenarios that aren't in the report.\n"
         f"2. State exactly which tool you will call and with which arguments (e.g. create_namespace(namespace_name='demo-2') or create_pod(pod_name='test-agent', image='nginx:latest', namespace='default')), using any names/values from the report verbatim. If the report already states a default image to use, use that exact image.\n"
-        f"3. Match the tool to the root cause: for a bad/unpullable image (ImagePullBackOff, ErrImagePull, InvalidImageName) use update_pod_image(pod_name=..., container_name=..., image=..., namespace=...) with the corrected image - do NOT use restart_pod for this, since restart_pod only deletes the pod and Kubernetes will not recreate it unless it's owned by a Deployment/ReplicaSet/etc. (and even if it is, the new pod would have the exact same bad image and fail again). Only propose restart_pod for genuinely transient failures where the pod spec itself is already correct.\n"
+        f"3. Match the tool to the root cause: for a bad/unpullable image (ImagePullBackOff, ErrImagePull, InvalidImageName) on a Deployment-owned pod, use patch_deployment_image(deployment_name=..., container_name=..., image=..., namespace=...) so the fix survives the next rollout; for a standalone pod use update_pod_image instead. Do NOT use restart_pod/rollout_restart_deployment for a bad image - the error is baked into the spec and a restart alone just fails the same way again. For a Deployment-owned pod in a genuinely transient crash loop where the spec is already correct, use rollout_restart_deployment rather than restart_pod (restart_pod only deletes one pod; rollout_restart_deployment cleanly recreates all replicas). Only propose restart_pod for a standalone pod's transient failure.\n"
         f"4. Keep it short: 2-4 sentences. Do not run any tools yet, just state the plan."
     )
 
@@ -154,6 +186,7 @@ def propose_remediation_node(state: AgentState) -> Dict[str, Any]:
         "proposed_fix": final_response
     }
 
+@_timed_node("apply_remediation")
 def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
     """
     Llama model node (Apply Fix).
@@ -173,8 +206,9 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
         f"{state['proposed_fix']}\n\n"
         f"Diagnostic Report context:\n"
         f"{state['diagnostic_report']}\n\n"
-        f"You MUST apply this fix by calling one of your tools (restart_pod, update_pod_image, scale_deployment, "
-        f"apply_kubernetes_yaml, create_namespace, create_pod) with the exact values from the plan above. "
+        f"You MUST apply this fix by calling one of your tools (restart_pod, update_pod_image, "
+        f"patch_deployment_image, rollout_restart_deployment, scale_deployment, apply_kubernetes_yaml, "
+        f"create_namespace, create_pod, delete_resource) with the exact values from the plan above. "
         f"Writing out a kubectl command in text does NOT apply anything - only an actual tool call "
         f"changes the cluster. Call the tool now."
     )
@@ -211,8 +245,9 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
                     continue
                 tool_func = remedy_tool_map.get(tc["name"])
                 if tool_func:
-                    print(f"\n[Remediation Agent] Applying fix via '{tc['name']}' with args: {tc['args']}")
+                    logger.info(f"tool_call remediation {tc['name']} args={tc['args']}")
                     result = tool_func.invoke(tc["args"])
+                    record_tool_call(tc["name"], result)
                     tool_invocations.append((tc["name"], tc["args"], result))
                     executed_signatures.add(signature)
                     curr_messages.append(HumanMessage(
@@ -259,6 +294,7 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
         "attempt": state.get("attempt", 0) + 1,
     }
 
+@_timed_node("verify_remediation")
 def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
     """
     Nova Pro model node (Verify).
@@ -293,8 +329,10 @@ def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
         f"Proposed Fix:\n{state.get('proposed_fix', '')}\n\n"
         f"Fix Execution Result:\n{fix_result}\n\n"
         f"Instructions:\n"
-        f"1. Use your tools (get_pod_status, describe_pod, get_pod_logs, get_pod_events, list_namespaces) "
-        f"to re-inspect the exact resource(s) that were changed.\n"
+        f"1. Use your tools (get_pod_status, describe_pod, get_pod_logs, get_pod_events, list_namespaces, "
+        f"list_deployments, describe_deployment, and any other relevant read tool) to re-inspect the exact "
+        f"resource(s) that were changed - if a Deployment was patched/restarted, check its rollout status too, "
+        f"not just the pods that happen to exist right now.\n"
         f"2. If the original issue was a crash/CrashLoopBackOff, confirm the pod is now Running and Ready, "
         f"and that its restart count/container state doesn't show it crashing again (a pod can look Running "
         f"for a few seconds and then crash again, so check the container state/reason too, not just phase).\n"
@@ -323,8 +361,9 @@ def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
             for tc in response.tool_calls:
                 tool_func = diag_tool_map.get(tc["name"])
                 if tool_func:
-                    print(f"\n[Verification Agent] Calling tool '{tc['name']}' with args: {tc['args']}")
+                    logger.info(f"tool_call verification {tc['name']} args={tc['args']}")
                     result = tool_func.invoke(tc["args"])
+                    record_tool_call(tc["name"], result)
                     curr_messages.append(HumanMessage(
                         content=str(result),
                         name=tc["name"],
@@ -360,9 +399,12 @@ def route_after_verify(state: AgentState) -> str:
     otherwise finishes.
     """
     if "GOAL_ACHIEVED: YES" in state.get("verification_result", ""):
+        REMEDIATION_OUTCOMES.labels(outcome="succeeded").inc()
         return END
     if state.get("attempt", 0) >= MAX_ATTEMPTS:
+        REMEDIATION_OUTCOMES.labels(outcome="exhausted").inc()
         return END
+    REMEDIATION_OUTCOMES.labels(outcome="retrying").inc()
     return "propose_retry"
 
 # 4. Build StateGraph
@@ -407,7 +449,9 @@ workflow.add_conditional_edges(
 # main.py. interrupt_before freezes execution right before applying a fix (needs approval)
 # and right before proposing a retry (needs a "try again?" decision) - main.py resumes
 # each pause with compiled_graph.invoke(None, config) once the human has decided.
-checkpointer = MemorySaver()
+# build_checkpointer() uses a Postgres-backed saver when DATABASE_URL is set (required for
+# >1 replica / surviving pod restarts), falling back to in-process MemorySaver otherwise.
+checkpointer = build_checkpointer()
 compiled_graph = workflow.compile(
     checkpointer=checkpointer,
     interrupt_before=["apply_remediation", "propose_retry"],

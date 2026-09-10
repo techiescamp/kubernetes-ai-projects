@@ -1,0 +1,16 @@
+# Optional - only apply this if the Prometheus Operator's CRDs (monitoring.coreos.com/v1) are
+# installed in your cluster. If you're scraping Prometheus targets another way (static config,
+# a PodMonitor, VictoriaMetrics, etc.), skip this file - /metrics on port 8000 is a standard
+# Prometheus exposition endpoint regardless of how it gets scraped.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ai-agent-backend
+  namespace: ai-agent
+spec:
+  selector:
+    matchLabels: {app: ai-agent-backend}
+  endpoints:
+    - port: http # matches the named port in 07-backend-service.yaml
+      path: /metrics
+      interval: 30s

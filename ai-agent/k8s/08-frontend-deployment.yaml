@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-agent-frontend
+  namespace: ai-agent
+  labels: {app: ai-agent-frontend}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: ai-agent-frontend}
+  template:
+    metadata:
+      labels: {app: ai-agent-frontend}
+    spec:
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: frontend
+          # NEXT_PUBLIC_BACKEND_URL is baked in at build time (frontend/Dockerfile ARG) using
+          # the same value as the ConfigMap key of the same name - rebuild the image if it changes.
+          image: ai-agent-frontend:latest # replace with your built/pushed image reference
+          ports:
+            - containerPort: 3000
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          readinessProbe:
+            httpGet: {path: /, port: 3000}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /, port: 3000}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      volumes:
+        - name: tmp
+          emptyDir: {}

@@ -24,7 +24,7 @@ interface UsageData {
 
 type Phase = "idle" | "busy" | "awaiting_decision" | "awaiting_retry";
 
-const backendUrl = "http://127.0.0.1:8000";
+const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8000";
 
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);

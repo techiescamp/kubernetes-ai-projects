@@ -1,2 +1,0 @@
-# AIOps for DevOps Engineers
-

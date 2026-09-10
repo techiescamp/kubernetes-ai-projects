@@ -1,25 +1,40 @@
+import logging
+import os
 import uuid
+
+from logging_config import configure_logging
+
+configure_logging()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from kubernetes import client as k8s_client
 from pydantic import BaseModel
 from langchain_classic.memory import ConversationBufferMemory
 from langchain_core.messages import HumanMessage
 
 from agents import compiled_graph, MAX_ATTEMPTS
+from bedrock_clients import bedrock_client
+from metrics import metrics_app
 from usage_tracker import get_usage_dict
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Kubernetes Diagnosis & Remediation Agent API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    # Matches the Next.js dev server on localhost/127.0.0.1 regardless of port -
-    # Next falls back to 3001, 3002, etc. when 3000 is already taken (e.g. by Grafana).
-    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
+    # Defaults to the Next.js dev server on localhost/127.0.0.1 regardless of port (Next falls
+    # back to 3001, 3002, etc. when 3000 is already taken). Set ALLOWED_ORIGINS in-cluster to the
+    # real frontend origin.
+    allow_origin_regex=os.getenv("ALLOWED_ORIGINS", r"http://(localhost|127\.0\.0\.1):\d+"),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Standard Prometheus scrape target.
+app.mount("/metrics", metrics_app)
 
 memory = ConversationBufferMemory(return_messages=True)
 
@@ -53,7 +68,33 @@ def _get_state(session_id: str):
 
 @app.get("/api/health")
 def health_check():
+    """Deprecated alias for /healthz, kept for compatibility with the current frontend."""
     return {"status": "ok", "backend": "FastAPI"}
+
+
+@app.get("/healthz")
+def liveness():
+    """Liveness probe target: process is up, no external calls. Always fast."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readiness():
+    """
+    Readiness probe target: confirms the pod can actually do its job (reach the Kubernetes API
+    and has a usable Bedrock client) before Kubernetes routes traffic to it.
+    """
+    try:
+        k8s_client.CoreV1Api().list_namespace(limit=1, _request_timeout=3)
+    except Exception as e:
+        logger.warning(f"readiness check failed: kubernetes api unreachable: {e}")
+        raise HTTPException(status_code=503, detail=f"kubernetes api unreachable: {e}")
+    try:
+        bedrock_client.meta.region_name
+    except Exception as e:
+        logger.warning(f"readiness check failed: bedrock client misconfigured: {e}")
+        raise HTTPException(status_code=503, detail=f"bedrock client misconfigured: {e}")
+    return {"status": "ready"}
 
 
 @app.get("/api/usage")
@@ -204,4 +245,9 @@ def submit_retry(request: RetryRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=os.getenv("ENVIRONMENT", "production") == "development",
+    )
