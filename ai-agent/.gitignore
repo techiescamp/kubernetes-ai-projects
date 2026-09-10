@@ -1,0 +1,19 @@
+# Environment variables (contains AWS region/model IDs, potentially credentials/pricing)
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+# Kubeconfig, if ever copied into the project
+kubeconfig
+*.kubeconfig
+
+# Frontend (Next.js)
+frontend/node_modules/
+frontend/.next/
+frontend/next-env.d.ts
+frontend/*.tsbuildinfo

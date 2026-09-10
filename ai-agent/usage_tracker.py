@@ -1,0 +1,98 @@
+import os
+from collections import defaultdict
+
+
+def _price(env_var: str) -> float:
+    """Reads an optional $/1K-token price from the environment. Blank or unset -> 0 (no cost estimate)."""
+    return float(os.getenv(env_var, "") or "0")
+
+
+# Optional $/1K-token prices, only used to estimate cost. Leave unset (or blank) to track
+# token counts only - fill these in from the AWS Bedrock pricing page for your region
+# if you want a live cost estimate printed alongside the token counts.
+_PRICING = {
+    "diagnostics": {
+        "input_per_1k": _price("DIAGNOSTICS_MODEL_PRICE_INPUT_PER_1K"),
+        "output_per_1k": _price("DIAGNOSTICS_MODEL_PRICE_OUTPUT_PER_1K"),
+    },
+    "remediation": {
+        "input_per_1k": _price("REMEDIATION_MODEL_PRICE_INPUT_PER_1K"),
+        "output_per_1k": _price("REMEDIATION_MODEL_PRICE_OUTPUT_PER_1K"),
+    },
+}
+
+_usage = defaultdict(lambda: {"input_tokens": 0, "output_tokens": 0, "calls": 0})
+
+
+def record_usage(role: str, response) -> None:
+    """
+    Accumulate token usage for a model call. `role` is 'diagnostics' or 'remediation'.
+    Reads usage_metadata off the AIMessage returned by ChatBedrock/ChatBedrockConverse.
+    """
+    meta = getattr(response, "usage_metadata", None)
+    if not meta:
+        return
+    entry = _usage[role]
+    entry["input_tokens"] += meta.get("input_tokens", 0) or 0
+    entry["output_tokens"] += meta.get("output_tokens", 0) or 0
+    entry["calls"] += 1
+
+
+def get_summary() -> str:
+    """Human-readable running total of tokens (and cost, if pricing env vars are set)."""
+    if not _usage:
+        return "Token usage this session: no model calls recorded yet."
+
+    lines = []
+    total_cost = 0.0
+    cost_available = False
+    for role, entry in _usage.items():
+        price = _PRICING.get(role, {"input_per_1k": 0, "output_per_1k": 0})
+        cost = (
+            entry["input_tokens"] / 1000 * price["input_per_1k"]
+            + entry["output_tokens"] / 1000 * price["output_per_1k"]
+        )
+        cost_str = ""
+        if price["input_per_1k"] or price["output_per_1k"]:
+            cost_available = True
+            total_cost += cost
+            cost_str = f", ~${cost:.4f}"
+        lines.append(
+            f"  {role}: {entry['calls']} calls, {entry['input_tokens']} input tokens, "
+            f"{entry['output_tokens']} output tokens{cost_str}"
+        )
+
+    header = "Token usage this session"
+    if cost_available:
+        header += f" (~${total_cost:.4f} estimated total)"
+    else:
+        header += " (set *_MODEL_PRICE_*_PER_1K env vars in .env for a cost estimate)"
+    return header + ":\n" + "\n".join(lines)
+
+
+def get_usage_dict() -> dict:
+    """Structured running total of tokens/cost per role, for API/UI consumption."""
+    roles = {}
+    total_cost = 0.0
+    cost_available = False
+    for role, entry in _usage.items():
+        price = _PRICING.get(role, {"input_per_1k": 0, "output_per_1k": 0})
+        cost = (
+            entry["input_tokens"] / 1000 * price["input_per_1k"]
+            + entry["output_tokens"] / 1000 * price["output_per_1k"]
+        )
+        role_cost = None
+        if price["input_per_1k"] or price["output_per_1k"]:
+            cost_available = True
+            total_cost += cost
+            role_cost = round(cost, 4)
+        roles[role] = {
+            "calls": entry["calls"],
+            "input_tokens": entry["input_tokens"],
+            "output_tokens": entry["output_tokens"],
+            "cost": role_cost,
+        }
+    return {
+        "roles": roles,
+        "total_cost": round(total_cost, 4) if cost_available else None,
+    }
