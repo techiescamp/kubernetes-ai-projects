@@ -1,82 +1,67 @@
-# Least-privilege (within a documented boundary) RBAC for the agent's expanded tool set in
-# k8s_tools.py. Split into read (get/list/watch) rules matching the diagnostic tools, and write
-# rules matching exactly what the remediation tools do.
+# RBAC for the agent's tool set in k8s_tools.py: broad READ, narrow curated WRITE.
 #
-# apply_kubernetes_yaml/delete_resource support a curated set of common workload kinds only
-# (matches k8s_tools.py's _ALLOWED_KINDS). This ClusterRole deliberately EXCLUDES:
-#   - rbac.authorization.k8s.io (Roles/ClusterRoles/Bindings) - so the agent can never grant
-#     itself (or anything else) more permissions than it already has.
-#   - write access to Secrets - the agent can list Secret names/keys for troubleshooting
-#     (k8s_tools.list_secrets never reads .data/.stringData) but can never create, update, or
-#     read secret VALUES.
+# READ is intentionally a cluster-wide wildcard (all API groups/kinds, including CRDs) so
+# `get_resource` - the generic fallback tool the agent uses for anything without a dedicated
+# tool (ResourceQuota, LimitRange, NetworkPolicy, RBAC bindings, custom resources, etc.) - can
+# actually inspect whatever the model decides is relevant, rather than being limited to a
+# hand-curated list that inevitably misses something. This is a deliberate trade-off: Kubernetes
+# RBAC has no "grant everything except X" primitive, so a wildcard read grant also technically
+# permits reading full Secret objects (including .data). The real boundary against that is
+# enforced in CODE, not RBAC: `get_resource` and `list_secrets` in k8s_tools.py both explicitly
+# refuse/redact Secret data regardless of what the ServiceAccount's token would otherwise permit -
+# see the comments there. If you need a hard RBAC-level guarantee instead of a code-level one,
+# swap this wildcard for a curated per-apiGroup list that omits "secrets" entirely (see git history
+# for the previous enumerated version) at the cost of not being able to inspect kinds outside that
+# list.
+#
+# WRITE stays a curated, explicit list matching exactly what the remediation tools do - broadening
+# read access doesn't change the write boundary at all. This ClusterRole deliberately EXCLUDES:
+#   - write access to rbac.authorization.k8s.io (Roles/ClusterRoles/Bindings) - so the agent can
+#     never grant itself (or anything else) more permissions than it already has (read access to
+#     these is fine and often needed for diagnosing permission errors - see the wildcard above).
+#   - write access to Secrets - never create/update/delete secret data.
 #
 # The real safety gate against misuse isn't RBAC alone - it's the human-approval interrupt in
 # agents.py (interrupt_before=["apply_remediation", "propose_retry"]): no write action listed
-# here ever runs without a person approving it via POST /api/decision first. RBAC is the backstop
-# that bounds what an approved action is even capable of doing.
+# here ever runs without a person approving it via POST /api/decision first. RBAC (and the code-
+# level Secret guard above) are backstops that bound what an approved action is even capable of.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: ai-agent
 rules:
-  # --- Read-only: diagnostics/verification tools ---
-  - apiGroups: [""]
-    resources:
-      - namespaces
-      - services
-      - configmaps
-      - persistentvolumeclaims
-      - persistentvolumes
-      - nodes
-      - events
+  # --- Read: everything, including CRDs (see header for the Secret-data trade-off) ---
+  - apiGroups: ["*"]
+    resources: ["*"]
     verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "list", "watch"] # names/keys/type only - k8s_tools.list_secrets never returns values
-  - apiGroups: [""]
-    resources: ["pods", "pods/log"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["apps"]
-    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["autoscaling"]
-    resources: ["horizontalpodautoscalers"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["metrics.k8s.io"]
-    resources: ["pods", "nodes"]
-    verbs: ["get", "list"]
 
-  # --- Write: remediation tools (restart_pod, update_pod_image, scale_deployment, etc.) ---
+  # --- Write: broad, per explicit request ("give agent permission for all resources if needed")
+  # after a real deployed test where the agent burned all 3 remediation attempts re-proposing a
+  # StorageClass change that RBAC/_ALLOWED_KINDS refused, with no way to ever succeed.
+  #
+  # This grants write on everything EXCEPT the rbac.authorization.k8s.io group, which is omitted
+  # below so the agent can never grant itself (or anything else) more permission than it already
+  # has. Kubernetes RBAC has no "all groups except X" primitive, so the groups are enumerated:
+  # "" (core), apps, batch, networking.k8s.io, storage.k8s.io, policy, autoscaling,
+  # apiextensions.k8s.io, scheduling.k8s.io. Add more here if the agent needs them.
+  #
+  # What actually bounds writes is NOT this list anymore - it is (a) the human-approval interrupt
+  # in agents.py, (b) _ALLOWED_KINDS in k8s_tools.py, which is what apply_kubernetes_yaml and
+  # delete_resource actually check, and (c) the code-level Secret-data guard. Widen _ALLOWED_KINDS
+  # too if you want the agent to be able to act on a kind listed here.
+  # Core group is enumerated rather than "*" specifically to keep "secrets" out of it - RBAC has
+  # no "all resources except X" primitive, so a "*" here would have silently granted secret writes
+  # and quietly removed a boundary the curated list used to enforce.
   - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["create", "delete", "patch"]
-  - apiGroups: [""]
-    resources: ["namespaces"]
-    verbs: ["create"] # deliberately no "delete" - deleting a namespace cascades to everything in
-                       # it; delete_resource's code path allows attempting it, but RBAC is the
-                       # backstop that blocks it regardless of what gets approved
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["update", "patch"]
-
-  # --- Write: apply_kubernetes_yaml / delete_resource, curated kinds only (see header) ---
-  - apiGroups: ["apps"]
-    resources: ["deployments", "statefulsets", "daemonsets"]
+    resources: ["pods", "services", "configmaps", "persistentvolumeclaims", "persistentvolumes",
+                "namespaces", "serviceaccounts", "endpoints", "resourcequotas", "limitranges",
+                "replicationcontrollers", "podtemplates"]
     verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: [""]
-    resources: ["services", "configmaps", "persistentvolumeclaims"]
-    verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses"]
-    verbs: ["create", "update", "patch", "delete"]
-  - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
+  # These groups contain no Secret-equivalent, so a wildcard is fine and keeps new kinds working
+  # without another RBAC edit.
+  - apiGroups: ["apps", "batch", "networking.k8s.io", "storage.k8s.io", "policy",
+                "autoscaling", "apiextensions.k8s.io", "scheduling.k8s.io"]
+    resources: ["*"]
     verbs: ["create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

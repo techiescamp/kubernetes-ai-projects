@@ -5,8 +5,6 @@ RUN npm ci
 
 FROM node:22-slim AS builder
 WORKDIR /app
-ARG NEXT_PUBLIC_BACKEND_URL
-ENV NEXT_PUBLIC_BACKEND_URL=$NEXT_PUBLIC_BACKEND_URL
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build

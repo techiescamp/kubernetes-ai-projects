@@ -50,14 +50,37 @@ subfolders with their own `Dockerfile`, mirroring each other:
 docker build -t <your-registry>/ai-agent-backend:latest backend/
 docker push <your-registry>/ai-agent-backend:latest
 
-docker build -t <your-registry>/ai-agent-frontend:latest \
-  --build-arg NEXT_PUBLIC_BACKEND_URL=http://ai-agent-backend:8000 \
-  frontend/
+docker build -t <your-registry>/ai-agent-frontend:latest frontend/
 docker push <your-registry>/ai-agent-frontend:latest
 ```
 
+The frontend no longer needs a build-time backend URL - it proxies the browser's relative `/api/*`
+calls to the backend server-side (see `frontend/next.config.ts`'s `rewrites()`), configured via the
+plain runtime `BACKEND_URL` env var in `08-frontend-deployment.yaml` (sourced from the ConfigMap).
+This is what makes the frontend work from a real browser regardless of how it's reached
+(`kubectl port-forward`, a LoadBalancer IP, an Ingress hostname) without ever needing a rebuild.
+
 Then update the `image:` field in `06-backend-deployment.yaml` and `08-frontend-deployment.yaml`
 to point at your pushed images.
+
+**Using Docker Hub specifically:** `<your-registry>` is `docker.io/<your-dockerhub-username>` (or
+just `<your-dockerhub-username>/...` - Docker's CLI defaults to Docker Hub when no registry host
+is given). A newly created Docker Hub repo is **private by default** unless you explicitly set it
+public, and a private image can't be pulled by the cluster without credentials - if yours is
+private, uncomment the `imagePullSecrets` block in both `06-backend-deployment.yaml` and
+`08-frontend-deployment.yaml`, then create the referenced secret once:
+
+```sh
+kubectl -n ai-agent create secret docker-registry ai-agent-registry \
+  --docker-server=https://index.docker.io/v1/ \
+  --docker-username=<your-dockerhub-username> \
+  --docker-password=<a Docker Hub access token, not your account password> \
+  --docker-email=<your-email>
+```
+
+(Generate the access token from Docker Hub under Account Settings -> Security -> New Access
+Token, scoped to Read-only if you only need pulls.) If the repo is public, skip this entirely and
+leave `imagePullSecrets` commented out.
 
 ## Phase 3: real AWS credentials + full deploy
 

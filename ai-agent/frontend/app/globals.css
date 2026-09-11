@@ -631,6 +631,100 @@ h1, h2, h3, h4 {
   background: rgba(239, 68, 68, 0.18);
 }
 
+.decision-btn.neutral {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--panel-border);
+  color: var(--text-secondary);
+}
+
+.decision-btn.neutral:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary);
+}
+
+/* Multi-issue selection panel - shown when diagnose found more than one distinct problem, so a
+   human can pick which one(s) to fix instead of getting them bundled into a single proposal. */
+.issue-select-panel {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--panel-border);
+}
+
+.issue-checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-secondary);
+  transition: var(--transition-smooth);
+}
+
+.issue-checkbox-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+}
+
+.issue-checkbox-row input[type="checkbox"] {
+  margin-top: 2px;
+  accent-color: #34d399;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* Custom-instruction box under the Approve/Reject and Try New Fix/Stop buttons - lets a human
+   redirect the proposed fix instead of only approving or rejecting it. */
+.guidance-form {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.guidance-input {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  outline: none;
+  padding: 8px 10px;
+  transition: var(--transition-smooth);
+}
+
+.guidance-input:focus {
+  border-color: rgba(0, 242, 254, 0.3);
+}
+
+.guidance-input::placeholder {
+  color: var(--text-muted);
+}
+
+.guidance-send-btn {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 0 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: var(--transition-smooth);
+}
+
+.guidance-send-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-primary);
+}
+
+.guidance-send-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* Goal status badge on remediation result messages */
 .goal-badge {
   display: inline-flex;

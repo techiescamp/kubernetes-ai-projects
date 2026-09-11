@@ -1,22 +1,8 @@
-# Environment variables (contains AWS region/model IDs, potentially credentials/pricing)
+# This file was found misplaced here (should live at ai-agent/.gitignore, which has been
+# restored with the full project-wide rules including k8s/secret.yaml). Left in place, scoped
+# correctly for this directory, since files can't be deleted in this environment.
 .env
-
-# Python
 __pycache__/
 *.pyc
-
-# Virtual environment
 venv/
-
-# Kubeconfig, if ever copied into the project
-kubeconfig
-*.kubeconfig
-
-# Frontend (Next.js)
-frontend/node_modules/
-frontend/.next/
-frontend/next-env.d.ts
-frontend/*.tsbuildinfo
-
-# Real k8s Secret manifest (filled in from k8s/04-secret.example.yaml) - never commit actual credentials
-k8s/secret.yaml
+.venv/

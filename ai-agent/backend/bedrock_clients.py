@@ -31,9 +31,11 @@ def get_diagnostics_model():
 def get_remediation_model():
     """
     Returns ChatBedrockConverse instance for the remediation model using resolved boto3
-    credentials. Uses the native Bedrock Converse API (not the legacy ChatBedrock invoke_model
-    path) because tool calling for Llama models is only reliable through Converse - the legacy
-    ChatBedrock class only auto-enables Converse API for Nova models.
+    credentials. Uses the native Bedrock Converse API explicitly (not the legacy ChatBedrock
+    invoke_model path) for reliable tool calling regardless of which model REMEDIATION_MODEL_ID
+    points at. Defaults to the same Nova Pro model as diagnostics - Llama4 Maverick was tried here
+    originally but Bedrock rejected it for this AWS account's country/region ("Access to Meta
+    Llama models is not allowed..."), confirmed via a real deployed test - see SPEC.md.
     """
     return ChatBedrockConverse(
         client=bedrock_client,

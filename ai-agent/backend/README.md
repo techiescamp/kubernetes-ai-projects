@@ -1,54 +1,15 @@
-# AIOps for DevOps Engineers
+# `ai-agent` backend
 
-A LangGraph multi-agent that diagnoses and (with human approval) remediates Kubernetes problems
-using AWS Bedrock: a read-only diagnostics/verification model (Amazon Nova Pro) and a remediation
-model (Meta Llama 4 Maverick) that proposes and applies fixes. Exposed via a FastAPI backend and a
-Next.js chat UI, with a `diagnose -> propose fix -> [human approval] -> apply -> verify -> retry`
-loop (`backend/agents.py`).
+This file was found misplaced here (the project's main README belongs at `ai-agent/README.md`,
+which has been restored). Kept in place, scoped to this directory, since files can't be deleted in
+this environment.
 
-## Structure
-
-```
-ai-agent/
-  backend/    Python/FastAPI agent - see backend/README below
-  frontend/   Next.js chat UI
-  k8s/        Kubernetes deployment manifests, RBAC, and deploy instructions
-```
-
-## Local development
+FastAPI + LangGraph agent. Run locally with:
 
 ```sh
-cd backend
-cp .env.example .env   # fill in AWS_REGION, model IDs, and any other values you want to set
+cp .env.example .env   # fill in AWS_REGION, model IDs, DATABASE_URL, etc.
 pip install -r requirements.txt
-python main.py          # backend on http://127.0.0.1:8000
-
-cd ../frontend
-npm install
-npm run dev              # frontend on http://localhost:3000
+python main.py          # http://127.0.0.1:8000
 ```
 
-Requires a working `kubectl` context (`~/.kube/config`) pointing at the cluster you want the agent
-to diagnose/remediate, and AWS credentials with `bedrock:InvokeModel` for the two model IDs in
-`backend/.env` (resolved via boto3's default credential chain - env vars, `~/.aws/credentials`, or
-an IAM role).
-
-## Deploying to Kubernetes
-
-See [`k8s/README.md`](k8s/README.md) for prerequisites, Dockerfiles, manifests (Deployment,
-Service, RBAC, NetworkPolicy, Postgres-backed durable memory, health probes), and a phased
-step-by-step deploy guide.
-
-## Key files
-
-| File | Purpose |
-|---|---|
-| `backend/agents.py` | LangGraph state machine - the diagnose/propose/apply/verify/retry loop |
-| `backend/k8s_tools.py` | Kubernetes API tools the agent calls (read-only diagnostics + write remediation) |
-| `backend/main.py` | FastAPI backend - `/api/query`, `/api/decision`, `/api/retry`, `/healthz`, `/readyz`, `/metrics` |
-| `backend/bedrock_clients.py` | AWS Bedrock model client factory |
-| `backend/checkpointer.py` | LangGraph checkpoint storage - Postgres if `DATABASE_URL` is set, in-memory otherwise |
-| `backend/usage_tracker.py` | Token usage/cost tracking |
-| `backend/Dockerfile` | Backend container image |
-| `frontend/` | Next.js chat UI (own `Dockerfile`) |
-| `k8s/` | Kubernetes deployment manifests, RBAC, and deploy instructions |
+See `../README.md` and `../k8s/README.md` for the full project overview and deployment guide.

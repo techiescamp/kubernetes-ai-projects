@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "DocuMancer AI - Kubernetes Diagnosis & Remediation",
-  description: "Reason-Act-Verify AIOps agent for Kubernetes, powered by AWS Bedrock (Nova Pro + Llama 4)",
+  title: "KubeMedic - Kubernetes Diagnosis & Remediation",
+  description: "Reason-Act-Verify AIOps agent for Kubernetes, powered by AWS Bedrock (Amazon Nova Pro)",
 };
 
 export default function RootLayout({

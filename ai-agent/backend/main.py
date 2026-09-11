@@ -10,10 +10,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from kubernetes import client as k8s_client
 from pydantic import BaseModel
-from langchain_classic.memory import ConversationBufferMemory
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
-from agents import compiled_graph, MAX_ATTEMPTS
+from agents import compiled_graph, MAX_ATTEMPTS, REQUIRE_APPROVAL, generate_proposal
 from bedrock_clients import bedrock_client
 from metrics import metrics_app
 from usage_tracker import get_usage_dict
@@ -21,6 +20,24 @@ from usage_tracker import get_usage_dict
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Kubernetes Diagnosis & Remediation Agent API", version="1.0.0")
+
+
+class ConversationMemory:
+    """
+    Minimal in-process replacement for langchain_classic's ConversationBufferMemory (that package
+    only supports the langchain>=1.0 line, which conflicts with the 0.3.x langchain/langchain-aws/
+    langchain-community versions this project is pinned to) - same two methods this app actually
+    uses, nothing else.
+    """
+    def __init__(self):
+        self._messages = []
+
+    def load_memory_variables(self, _inputs):
+        return {"history": list(self._messages)}
+
+    def save_context(self, inputs, outputs):
+        self._messages.append(HumanMessage(content=inputs.get("input", "")))
+        self._messages.append(AIMessage(content=outputs.get("output", "")))
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,7 +53,7 @@ app.add_middleware(
 # Standard Prometheus scrape target.
 app.mount("/metrics", metrics_app)
 
-memory = ConversationBufferMemory(return_messages=True)
+memory = ConversationMemory()
 
 
 class QueryRequest(BaseModel):
@@ -51,6 +68,16 @@ class DecisionRequest(BaseModel):
 class RetryRequest(BaseModel):
     session_id: str
     retry: bool
+
+
+class GuidanceRequest(BaseModel):
+    session_id: str
+    instruction: str
+
+
+class IssueSelectionRequest(BaseModel):
+    session_id: str
+    selected_indices: list[int] = []  # empty/omitted means "fix all issues found"
 
 
 def _get_state(session_id: str):
@@ -75,7 +102,7 @@ def health_check():
 @app.get("/healthz")
 def liveness():
     """Liveness probe target: process is up, no external calls. Always fast."""
-    return {"status": "ok"}
+    return {"status": "ok", "require_approval": REQUIRE_APPROVAL}
 
 
 @app.get("/readyz")
@@ -115,6 +142,7 @@ def submit_query(request: QueryRequest):
     state = {
         "messages": history + [HumanMessage(content=query)],
         "diagnostic_report": "",
+        "issues": [],
         "proposed_fix": "",
         "approval_status": "pending",
         "fix_result": "",
@@ -122,13 +150,52 @@ def submit_query(request: QueryRequest):
         "attempt": 0,
     }
 
-    # Runs diagnose -> (propose_remediation ->) and freezes right before apply_remediation
-    # if a fix is needed, thanks to interrupt_before in agents.py.
+    # If REQUIRE_APPROVAL=true (default): runs diagnose -> (propose_remediation ->) and freezes
+    # right before apply_remediation if a fix is needed, thanks to interrupt_before in agents.py -
+    # or, if diagnose_node found more than one distinct issue, freezes one step earlier, right
+    # before select_issues, so the human can pick which issue(s) to act on first.
+    # If REQUIRE_APPROVAL=false: nothing to freeze at - this single invoke() runs the whole
+    # diagnose -> propose -> apply -> verify -> retry loop to completion with no human in the loop.
     output_state = compiled_graph.invoke(state, config)
     diag_report = output_state.get("diagnostic_report", "")
     proposed_fix = output_state.get("proposed_fix", "")
+    fix_result = output_state.get("fix_result", "")
+    verification = output_state.get("verification_result", "")
 
-    paused = bool(compiled_graph.get_state(config).next)
+    next_nodes = compiled_graph.get_state(config).next
+    paused = bool(next_nodes)
+
+    if "select_issues" in next_nodes:
+        return {
+            "session_id": session_id,
+            "remediation_needed": True,
+            "needs_issue_selection": True,
+            "diagnostic_report": diag_report,
+            "issues": output_state.get("issues", []),
+        }
+
+    if not paused and fix_result:
+        # REQUIRE_APPROVAL=false and a fix was actually applied (and possibly retried) - report
+        # the complete outcome in one response, same shape as /api/decision's "done" response.
+        goal_achieved = "GOAL_ACHIEVED: YES" in verification
+        memory.save_context(
+            {"input": query},
+            {"output": (
+                f"Diagnostic Report:\n{diag_report}\n\nProposed Fix:\n{proposed_fix}\n\n"
+                f"Execution Result:\n{fix_result}\n\nVerification:\n{verification}"
+            )},
+        )
+        return {
+            "remediation_needed": True,
+            "auto_approved": True,
+            "diagnostic_report": diag_report,
+            "proposed_fix": proposed_fix,
+            "fix_result": fix_result,
+            "verification": verification,
+            "goal_achieved": goal_achieved,
+            "attempt": output_state.get("attempt", 0),
+            "max_attempts": MAX_ATTEMPTS,
+        }
 
     if not paused:
         memory.save_context({"input": query}, {"output": diag_report})
@@ -161,10 +228,63 @@ def submit_decision(request: DecisionRequest):
         )
         return {"status": "cancelled"}
 
-    # Lift the approval gate and resume: runs apply_remediation -> verify_remediation,
-    # then either ends or freezes again right before propose_retry.
+    # Lift the approval gate and resume: runs apply_remediation -> verify_remediation.
     compiled_graph.update_state(config, {"approval_status": "approved"})
     output_state = compiled_graph.invoke(None, config)
+    # One entry per apply+verify cycle - a real deployed test showed why this matters: with the
+    # auto-continue loop below, a LATER attempt's proposal can take a completely different (and
+    # sometimes worse) approach than an earlier one, but only the FINAL attempt's fix_result used
+    # to be returned - an intermediate attempt that made a harmful or simply wrong change (e.g.
+    # repointing a working reference at the wrong resource) was invisible to the human, who'd only
+    # ever see the last attempt's outcome. Returning the full history makes every attempt's actual
+    # tool calls visible, not just the last one.
+    attempt_history = [{
+        "attempt": output_state.get("attempt", 0),
+        "proposed_fix": output_state.get("proposed_fix", ""),
+        "fix_result": output_state.get("fix_result", ""),
+        "verification": output_state.get("verification_result", ""),
+    }]
+
+    # Once the human has approved once, keep driving the retry loop ourselves instead of pausing
+    # to ask "approve this new attempt too?" every single cycle - a real deployed test showed that
+    # cost two extra clicks (Try New Fix, then Approve again) per retry even though the human's
+    # original "yes, fix it" already covers further attempts at the SAME issue. Runs until the
+    # graph actually finishes (goal achieved or MAX_ATTEMPTS exhausted - both end the graph via
+    # route_after_verify), so this can take a while for a multi-attempt fix. A human who wants a
+    # different approach mid-loop should use /api/guidance instead of approving in the first place.
+    while True:
+        next_nodes = compiled_graph.get_state(config).next
+        if "propose_retry" in next_nodes:
+            # Feed the failed attempt back in as fresh diagnostic evidence before letting
+            # propose_retry generate the next proposal - the manual /api/retry endpoint always did
+            # this, but this auto-continue loop didn't, which was a real bug: propose_retry reuses
+            # propose_remediation_node, so with no updated diagnostic_report it had zero idea the
+            # previous attempt had even happened, let alone failed or why - confirmed via a real
+            # deployed test where all 3 auto-continued attempts proposed the exact same REFUSED
+            # apply_kubernetes_yaml call for a StorageClass, since nothing ever told the model that
+            # call had already been rejected.
+            prev = compiled_graph.get_state(config).values
+            updated_report = (
+                f"{prev.get('diagnostic_report', '')}\n\n"
+                f"--- Previous fix attempt {prev.get('attempt', 0)} ---\n"
+                f"Applied: {prev.get('fix_result', '')}\n"
+                f"Verification: {prev.get('verification_result', '')}\n"
+                f"REMEDIATION_NEEDED: YES"
+            )
+            compiled_graph.update_state(config, {"diagnostic_report": updated_report})
+            output_state = compiled_graph.invoke(None, config)
+            next_nodes = compiled_graph.get_state(config).next
+        if "apply_remediation" in next_nodes:
+            compiled_graph.update_state(config, {"approval_status": "approved"})
+            output_state = compiled_graph.invoke(None, config)
+            attempt_history.append({
+                "attempt": output_state.get("attempt", 0),
+                "proposed_fix": output_state.get("proposed_fix", ""),
+                "fix_result": output_state.get("fix_result", ""),
+                "verification": output_state.get("verification_result", ""),
+            })
+        else:
+            break
 
     fix_result = output_state.get("fix_result", "")
     verification = output_state.get("verification_result", "")
@@ -190,12 +310,14 @@ def submit_decision(request: DecisionRequest):
             "goal_achieved": goal_achieved,
             "attempt": attempt,
             "max_attempts": MAX_ATTEMPTS,
+            "attempt_history": attempt_history,
         }
 
     return {
         "status": "retry_available",
         "fix_result": fix_result,
         "verification": verification,
+        "attempt_history": attempt_history,
         "goal_achieved": False,
         "attempt": attempt,
         "max_attempts": MAX_ATTEMPTS,
@@ -241,6 +363,108 @@ def submit_retry(request: RetryRequest):
         "attempt": output_state.get("attempt", 0),
         "max_attempts": MAX_ATTEMPTS,
     }
+
+
+@app.post("/api/select-issues")
+def submit_issue_selection(request: IssueSelectionRequest):
+    """
+    Resumes a session paused at select_issues (diagnose_node found more than one distinct
+    problem) with the human's choice of which issue(s) to actually act on. Narrows
+    diagnostic_report to just the selected issue(s) before letting propose_remediation run, so a
+    fix only ever gets proposed/applied for what the human picked - the other issue(s) found are
+    left untouched and simply not mentioned again for this session. Empty/omitted
+    selected_indices means "fix everything that was found."
+    """
+    config, snapshot = _get_state(request.session_id)
+    state = snapshot.values
+    issues = state.get("issues", [])
+
+    indices = request.selected_indices or list(range(len(issues)))
+    invalid = [i for i in indices if not (0 <= i < len(issues))]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Invalid issue index/indices: {invalid}")
+    selected = [issues[i] for i in indices]
+
+    narrowed_report = (
+        f"The user reviewed {len(issues)} issue(s) found during diagnosis and selected the "
+        f"following {len(selected)} to fix now - address ONLY these, ignore the rest:\n"
+        + "\n".join(f"- {text}" for text in selected)
+        + f"\n\nFull original diagnostic context (for reference only):\n{state.get('diagnostic_report', '')}"
+        + f"\n\nREMEDIATION_NEEDED: YES"
+    )
+    compiled_graph.update_state(config, {"diagnostic_report": narrowed_report})
+
+    # Lifts the select_issues gate and resumes: runs propose_remediation, then freezes again
+    # right before apply_remediation, waiting for approval via /api/decision - same shape as a
+    # normal single-issue proposal from here on.
+    output_state = compiled_graph.invoke(None, config)
+
+    return {
+        "session_id": request.session_id,
+        "remediation_needed": True,
+        "diagnostic_report": narrowed_report,
+        "proposed_fix": output_state.get("proposed_fix", ""),
+    }
+
+
+@app.post("/api/guidance")
+def submit_guidance(request: GuidanceRequest):
+    """
+    Lets a human redirect the proposed fix with a free-text instruction instead of only
+    Approve/Reject - e.g. "no, attach it via envFrom, not an annotation" - covering both the
+    very first proposal and a post-verification retry proposal. Always produces a fresh,
+    human-reviewable proposal rather than auto-applying the instruction: arbitrary free text
+    changing what gets run on the cluster deserves a look before it's approved, same as any
+    other proposal.
+    """
+    instruction = request.instruction.strip()
+    if not instruction:
+        raise HTTPException(status_code=400, detail="Instruction cannot be empty.")
+
+    config, snapshot = _get_state(request.session_id)
+    state = snapshot.values
+    next_nodes = compiled_graph.get_state(config).next
+
+    guidance_block = (
+        f"\n\n--- Human guidance for the next attempt ---\n{instruction}\nREMEDIATION_NEEDED: YES"
+    )
+
+    if "propose_retry" in next_nodes:
+        # Paused after a failed verification, awaiting a Try New Fix/Stop decision (same state
+        # /api/retry acts on) - fold the instruction in the same way, then let the graph's real
+        # retry node (propose_retry) generate the new proposal so it stays consistent with a
+        # normal retry.
+        base_report = (
+            f"{state.get('diagnostic_report', '')}\n\n"
+            f"--- Previous fix attempt {state.get('attempt', 0)} ---\n"
+            f"Applied: {state.get('fix_result', '')}\n"
+            f"Verification: {state.get('verification_result', '')}"
+        )
+        compiled_graph.update_state(config, {"diagnostic_report": base_report + guidance_block})
+        output_state = compiled_graph.invoke(None, config)
+        return {
+            "status": "proposed",
+            "proposed_fix": output_state.get("proposed_fix", ""),
+            "attempt": output_state.get("attempt", 0),
+            "max_attempts": MAX_ATTEMPTS,
+        }
+
+    if "apply_remediation" in next_nodes:
+        # Paused before applying a proposal that hasn't run yet (the very first proposal, or one
+        # already redirected once) - there's no graph node to "go back and re-propose" from here,
+        # so generate the new proposal directly and swap it into state while staying paused at the
+        # same point. A subsequent /api/decision(approved=true) applies THIS new proposal.
+        new_report = state.get("diagnostic_report", "") + guidance_block
+        new_fix = generate_proposal(new_report, state.get("user_request", ""))
+        compiled_graph.update_state(config, {"diagnostic_report": new_report, "proposed_fix": new_fix})
+        return {
+            "status": "proposed",
+            "proposed_fix": new_fix,
+            "attempt": state.get("attempt", 0),
+            "max_attempts": MAX_ATTEMPTS,
+        }
+
+    raise HTTPException(status_code=409, detail="Session is not currently awaiting a decision.")
 
 
 if __name__ == "__main__":

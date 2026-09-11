@@ -2,6 +2,10 @@ FROM python:3.12-slim AS base
 
 WORKDIR /app
 
+# Don't write .pyc cache files (pointless and noisy under readOnlyRootFilesystem in k8s), and
+# flush stdout/stderr immediately so `kubectl logs` shows output in real time, not buffered.
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
 RUN useradd -u 10001 -m appuser
 
 COPY requirements.txt .

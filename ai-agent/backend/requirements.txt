@@ -1,12 +1,10 @@
-# Pinned to known-good versions. This environment has no local Python/pip to resolve exact
-# versions against - before building the container image, run `pip install -r requirements.txt`
-# in a clean venv, then `pip freeze` and replace these pins with what actually resolved, to get
-# a fully reproducible build.
+# Verified via a real `docker build` (2026-09-11) - these pins install cleanly together and the
+# full app (agents.py -> main.py, all modules) imports successfully against the resulting
+# langchain-core==0.3.86. Re-verify with a fresh build if any of these are bumped.
 langgraph==0.6.6
 langchain==0.3.27
 langchain-aws==0.2.32
 langchain-community==0.3.30
-langchain-classic==0.3.1
 kubernetes==31.0.0
 boto3==1.40.11
 python-dotenv==1.1.1

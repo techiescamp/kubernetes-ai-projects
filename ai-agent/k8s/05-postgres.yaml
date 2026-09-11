@@ -53,11 +53,17 @@ spec:
             requests: {cpu: 100m, memory: 256Mi}
             limits: {cpu: 500m, memory: 512Mi}
           readinessProbe:
-            exec: {command: ["pg_isready", "-U", "$(POSTGRES_USER)"]}
+            # Exec probe commands are passed directly to exec(), not a shell, so $(VAR) env
+            # substitution (which only works in container `env:` values) doesn't apply here -
+            # route through `sh -c` so $POSTGRES_USER actually expands.
+            exec: {command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\""]}
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            exec: {command: ["pg_isready", "-U", "$(POSTGRES_USER)"]}
+            # Exec probe commands are passed directly to exec(), not a shell, so $(VAR) env
+            # substitution (which only works in container `env:` values) doesn't apply here -
+            # route through `sh -c` so $POSTGRES_USER actually expands.
+            exec: {command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\""]}
             initialDelaySeconds: 15
             periodSeconds: 20
           securityContext:
