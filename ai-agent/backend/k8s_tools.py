@@ -45,6 +45,10 @@ _ALLOWED_KINDS = {
     # (REQUIRE_APPROVAL, on by default) is the only thing standing between a proposed change and
     # the cluster. Keep that gate on.
     "Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding", "Secret",
+    # Node was missing, which blocked an entirely ordinary fix: labelling a node so a pod with a
+    # nodeSelector can schedule. Nothing about that is dangerous. Deleting a Node IS dangerous and
+    # is refused separately in delete_resource.
+    "Node",
 }
 # Case-insensitive lookup -> canonical casing. A real deployed test showed a model calling
 # delete_resource(kind='pod') (lowercase) - Kubernetes `kind` values are always PascalCase, but an
@@ -161,6 +165,44 @@ def _target_is_unhealthy(kind: str, name: str, namespace: Optional[str]) -> Opti
         return None
     except Exception:
         return None
+    return None
+
+
+# Container states that are baked into the pod SPEC. Restarting cannot clear any of them - the
+# replacement pod is created from the same spec and fails identically - so a restart proposed as
+# the fix for one of these is always wrong; the spec itself has to be patched.
+_SPEC_BAKED_REASONS = {
+    "CreateContainerConfigError": "a referenced ConfigMap/Secret or key is missing or wrong",
+    "ImagePullBackOff": "the image cannot be pulled (wrong name/tag or missing credentials)",
+    "ErrImagePull": "the image cannot be pulled (wrong name/tag or missing credentials)",
+    "InvalidImageName": "the image name is not valid",
+    "CreateContainerError": "the container cannot be created from this spec",
+    "RunContainerError": "the container cannot be started from this spec",
+}
+
+
+def _restart_would_not_help(pod) -> Optional[str]:
+    """
+    If the pod is failing for a reason a restart cannot possibly clear, return an explanation.
+
+    Restarting is the classic non-fix: it looks like action, changes nothing, and the pod comes
+    back in exactly the same state because the fault lives in the spec, not in the running
+    container. Detect that case and say what to patch instead.
+    """
+    statuses = list(pod.status.container_statuses or []) + list(pod.status.init_container_statuses or [])
+    for cs in statuses:
+        waiting = getattr(cs.state, "waiting", None) if cs.state else None
+        reason = getattr(waiting, "reason", None) if waiting else None
+        if reason in _SPEC_BAKED_REASONS:
+            return f"{reason} - {_SPEC_BAKED_REASONS[reason]}"
+    # Pending with no node assigned = unschedulable (nodeSelector/affinity/taints/resources).
+    if (pod.status.phase or "") == "Pending" and not (pod.spec.node_name or ""):
+        for cond in (pod.status.conditions or []):
+            if cond.type == "PodScheduled" and cond.status == "False":
+                return (
+                    f"the pod cannot be scheduled ({cond.reason or 'Unschedulable'}: "
+                    f"{(cond.message or '')[:160]})"
+                )
     return None
 
 
@@ -1029,6 +1071,29 @@ def get_resource(kind: str, name: Optional[str] = None, namespace: Optional[str]
 
 
 @tool
+def label_node(node_name: str, labels: Dict[str, Any]) -> str:
+    """
+    Add or update labels on a Node (equivalent to `kubectl label node <name> k=v --overwrite`).
+    This is the fix when a pod is Pending because its nodeSelector/nodeAffinity matches no node -
+    label a node so the scheduler can place it. Pass {"key": null} to REMOVE a label.
+    Only labels are changed; nothing else about the node is touched, and this never cordons,
+    drains or deletes anything.
+    """
+    try:
+        v1 = client.CoreV1Api()
+        v1.patch_node(name=node_name, body={"metadata": {"labels": labels}})
+        node = v1.read_node(name=node_name)
+        applied = {k: v for k, v in (node.metadata.labels or {}).items() if k in labels}
+        return (
+            f"Successfully labelled node '{node_name}'. Requested {json.dumps(labels)}; "
+            f"node now reports {json.dumps(applied)}. Any pod Pending only because of a matching "
+            f"nodeSelector should now schedule."
+        )
+    except Exception as e:
+        return f"Error labelling node '{node_name}': {str(e)}"
+
+
+@tool
 def restart_pod(pod_name: str, namespace: str) -> str:
     """
     Restart a pod by deleting it. Kubernetes will only recreate it automatically if it is
@@ -1047,6 +1112,27 @@ def restart_pod(pod_name: str, namespace: str) -> str:
         if refusal:
             return refusal
         v1 = client.CoreV1Api()
+        # "Restart" here means DELETE, so a standalone pod is destroyed exactly as it would be by
+        # delete_resource - which already refuses this. The same guard has to live here or the
+        # protection is trivially sidestepped by calling restart_pod instead.
+        pod = v1.read_namespaced_pod(name=pod_name, namespace=namespace)
+        pointless = _restart_would_not_help(pod)
+        if pointless:
+            return (
+                f"REFUSED: restarting Pod/{pod_name} in '{namespace}' would change nothing - it is "
+                f"failing because {pointless}. That fault is in the spec (or the cluster around "
+                f"it), so the replacement pod fails identically. Patch the actual cause instead: "
+                f"fix the image with update_pod_image/patch_deployment_image, the env/volumes/"
+                f"selector with patch_deployment, or create the missing ConfigMap/Secret/node label."
+            )
+        if not (pod.metadata.owner_references or []):
+            return (
+                f"REFUSED: Pod/{pod_name} in '{namespace}' is a standalone pod (no "
+                f"ownerReferences). 'Restarting' it means deleting it, and nothing would recreate "
+                f"it - the pod would be gone for good. Fix the actual cause instead; if it must be "
+                f"recreated, capture its spec with get_resource, then delete_resource with "
+                f"recreating=true followed by apply_kubernetes_yaml."
+            )
         v1.delete_namespaced_pod(name=pod_name, namespace=namespace)
         return f"Successfully initiated restart (deletion) of pod '{pod_name}' in namespace '{namespace}'."
     except Exception as e:
@@ -1232,6 +1318,25 @@ def rollout_restart_deployment(deployment_name: str, namespace: str) -> str:
         refusal = check_write_allowed("Deployment", deployment_name, namespace)
         if refusal:
             return refusal
+        # Same check as restart_pod: rolling the Deployment recreates pods from the SAME template,
+        # so a spec-baked fault survives the rollout untouched.
+        try:
+            dep = client.AppsV1Api().read_namespaced_deployment(name=deployment_name, namespace=namespace)
+            selector = ",".join(f"{k}={v}" for k, v in (dep.spec.selector.match_labels or {}).items())
+            if selector:
+                for pod in client.CoreV1Api().list_namespaced_pod(
+                        namespace=namespace, label_selector=selector).items:
+                    pointless = _restart_would_not_help(pod)
+                    if pointless:
+                        return (
+                            f"REFUSED: rolling Deployment/{deployment_name} in '{namespace}' would "
+                            f"change nothing - its pods are failing because {pointless}. New pods "
+                            f"come from the same template and fail the same way. Patch the template "
+                            f"instead (patch_deployment_image for the image, patch_deployment for "
+                            f"env/volumes/selector), or create the missing dependency."
+                        )
+        except ApiException:
+            pass  # can't inspect - fall through and let the rollout proceed
         import datetime
         apps_v1 = client.AppsV1Api()
         patch = {
@@ -1432,9 +1537,14 @@ def create_pod(pod_name: str, image: str, namespace: str, container_port: Option
 
 
 @tool
-def delete_resource(kind: str, name: str, namespace: Optional[str] = None) -> str:
+def delete_resource(kind: str, name: str, namespace: Optional[str] = None,
+                    recreating: bool = False) -> str:
     """
-    Delete a resource by kind and name. Restricted to the same allowed kinds as
+    Delete a resource by kind and name. Set recreating=true ONLY when this delete is the first
+    half of a delete-then-recreate you are about to complete with apply_kubernetes_yaml (needed
+    to change an immutable field) - it is required before deleting a standalone Pod, because
+    nothing recreates one and deleting it otherwise just destroys the workload.
+    Restricted to the same allowed kinds as
     apply_kubernetes_yaml (common workload, storage, networking and policy kinds - Secrets and
     RBAC objects are never allowed). Use for cleaning up ad-hoc/test resources created during
     remediation, or to recreate an object whose spec has immutable fields.
@@ -1489,6 +1599,40 @@ def delete_resource(kind: str, name: str, namespace: Optional[str] = None) -> st
                 f"Error: no namespace given for namespaced kind '{kind}'. Specify the namespace "
                 f"'{name}' actually lives in and retry - this tool will not default to 'default'."
             )
+
+        if kind == "Node":
+            return (
+                f"REFUSED: deleting Node/{name} removes a machine from the cluster and evicts "
+                f"everything on it. Node labels/taints can be changed with label_node or "
+                f"apply_kubernetes_yaml; removing a node is an infrastructure operation for a human."
+            )
+
+        if kind == "Pod":
+            # A pod with no ownerReferences is not recreated by anything - deleting it destroys
+            # the workload outright. A real deployed run deleted a Pending standalone pod to
+            # "fix" it and then reported success because the pod was "no longer present",
+            # leaving the user with nothing. Deleting one is only ever valid as the first half
+            # of a delete-then-recreate, so require the caller to say that is what it is.
+            try:
+                pod = client.CoreV1Api().read_namespaced_pod(name=name, namespace=namespace)
+                if not (pod.metadata.owner_references or []):
+                    if not recreating:
+                        return (
+                            f"REFUSED: Pod/{name} in '{namespace}' is a standalone pod (no "
+                            f"ownerReferences), so NOTHING will recreate it - deleting it destroys "
+                            f"the workload permanently and does not fix anything. If the pod is "
+                            f"broken, fix the underlying cause instead (the node label/selector, "
+                            f"image, config or volume it is waiting on). If you genuinely must "
+                            f"recreate it, first capture its full spec with get_resource, then "
+                            f"call this tool again with recreating=true and immediately re-create "
+                            f"it with apply_kubernetes_yaml."
+                        )
+                    logger.warning(
+                        "deleting standalone pod %s/%s for a recreate - caller must re-create it",
+                        namespace, name,
+                    )
+            except ApiException:
+                pass  # already gone / unreadable - let the delete itself report
 
         if kind == "PersistentVolume":
             try:

@@ -17,7 +17,7 @@ from k8s_tools import (
     list_pvcs, list_jobs, list_cronjobs, list_statefulsets, list_daemonsets, list_hpas,
     get_resource_usage, get_resource, check_permission,
     restart_pod, scale_deployment, apply_kubernetes_yaml, create_namespace, create_pod,
-    update_pod_image, patch_deployment_image, patch_deployment, rollout_restart_deployment,
+    update_pod_image, patch_deployment_image, patch_deployment, rollout_restart_deployment, label_node,
     delete_resource,
 )
 
@@ -63,7 +63,7 @@ diag_tools = [
 ]
 remedy_tools = [
     restart_pod, update_pod_image, patch_deployment_image, patch_deployment,
-    rollout_restart_deployment, scale_deployment, apply_kubernetes_yaml, create_namespace,
+    rollout_restart_deployment, scale_deployment, apply_kubernetes_yaml, create_namespace, label_node,
     create_pod, delete_resource,
 ]
 
@@ -127,6 +127,12 @@ def _strip_reasoning_markup(text: str) -> str:
         if stripped == text:
             break
         text = stripped
+    # A label mid-text means the model started appending a second section it was never asked for
+    # (copied from the shape of its own stored history) - cut everything from there on.
+    text = re.split(
+        r"\n\s*(?:Proposed\s*\(awaiting approval\)|Proposed Fix|Proposed Remediation)\s*:",
+        text, maxsplit=1, flags=re.IGNORECASE,
+    )[0]
     # Collapse the blank lines the removal leaves behind.
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -146,6 +152,71 @@ def _extract_flag(text: str, flag: str) -> tuple:
     is_yes = bool(match) and match.group(1).upper() == "YES"
     cleaned = re.sub(rf"^\s*{flag}:\s*(YES|NO)\b.*$", "", text, flags=re.MULTILINE | re.IGNORECASE)
     return is_yes, re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+def _parse_issues(text: str) -> List[str]:
+    """
+    Pull the list of distinct problems out of a diagnostic report.
+
+    The prompt asks for lines prefixed exactly 'ISSUE: ', but the model does not always comply -
+    a real deployed run wrote an "Issues:" heading followed by ordinary markdown bullets instead,
+    which the strict regex matched zero of, so a two-problem report silently skipped the
+    issue-selection step and bundled both fixes together. Accept the marker form first, then fall
+    back to bullets under an "Issues"-style heading, so the picker doesn't depend on exact
+    formatting the model may or may not produce.
+    """
+    marked = [m.strip() for m in re.findall(r"^\s*ISSUE:\s*(.+)$", text, re.MULTILINE)]
+    if marked:
+        return marked
+
+    heading = re.search(r"^\s*(?:issues?|problems?|issues? found)\s*:\s*$", text,
+                        re.MULTILINE | re.IGNORECASE)
+    if not heading:
+        return []
+    bullets = []
+    for line in text[heading.end():].splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if bullets:
+                break  # blank line ends the list
+            continue
+        bullet = re.match(r"^(?:[-*+]|\d+[.)])\s+(.*)$", stripped)
+        if not bullet:
+            break  # prose resumed - the list is over
+        bullets.append(bullet.group(1).strip())
+    # One bullet is just a single problem written as a list; no need to ask which to fix.
+    return bullets if len(bullets) > 1 else []
+
+
+def _extract_issues_structured(report: str, model) -> List[str]:
+    """
+    Ask the model to enumerate the distinct problems as JSON.
+
+    Regex over the report's prose kept failing because the wording changes every run - 'ISSUE:'
+    markers, then markdown bullets under an 'Issues:' heading, then 'There are two issues in the
+    cluster:' followed by plain sentences. Each time the picker silently vanished and both fixes
+    got bundled into one. A tiny dedicated extraction call is deterministic to parse and does not
+    care how the report happens to be phrased.
+    """
+    try:
+        response = model.invoke([HumanMessage(content=(
+            "Read this Kubernetes diagnostic report and list the DISTINCT problems it describes - "
+            "separate problems affecting different resources or with unrelated root causes. Two "
+            "symptoms of the SAME underlying fault count as one problem.\n\n"
+            "Reply with ONLY a JSON array of strings, nothing else. Each string names the resource, "
+            "its namespace and what is wrong, and must stand alone. Use [] if nothing is wrong.\n\n"
+            f"Report:\n{report}"
+        ))])
+        record_usage("diagnostics", response)
+        raw = clean_message_content(response.content).strip()
+        match = re.search(r"\[.*\]", raw, re.DOTALL)  # tolerate ```json fences / stray prose
+        if not match:
+            return []
+        parsed = json.loads(match.group(0))
+        return [str(i).strip() for i in parsed if str(i).strip()] if isinstance(parsed, list) else []
+    except Exception as e:
+        logger.warning(f"structured issue extraction failed, continuing without a picker: {e}")
+        return []
 
 
 def _describe_tool_call(name: str, args: dict) -> str:
@@ -336,11 +407,15 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
     # One line per "ISSUE: ..." the model called out (see prompt guideline 4) - empty when it
     # found zero or one problem, which is the common case and needs no selection step at all
     # (route_after_diagnose below only detours through select_issues when this has >1 entry).
-    issues = re.findall(r"^ISSUE:\s*(.+)$", final_response, re.MULTILINE)
+    # Explicit markers are the cheap path; otherwise ask for the list as JSON rather than trying
+    # to guess the report's prose format (see _extract_issues_structured).
+    issues = _parse_issues(final_response)
 
     # Parse the routing flag into real state, then strip it (and the ISSUE: prefixes, which are a
     # machine-readable marker for the selection UI) out of the prose the user actually reads.
     remediation_needed, final_response = _extract_flag(final_response, "REMEDIATION_NEEDED")
+    if remediation_needed and not issues:
+        issues = _extract_issues_structured(final_response, model)
     # Remove the ISSUE: lines from the displayed text entirely. They are a machine-readable
     # marker: the UI already lists them as selectable checkboxes, and the prose above them says
     # the same thing, so rendering them as bullets too stated every finding twice.
@@ -654,14 +729,12 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
             # attempts re-proposing the same Role edit and, in between, flailed into nonsense
             # (patch_deployment against a Role name, 404). Stop here and tell the human what to
             # run themselves instead of spending two more attempts and their money on it.
+            # The refusal text already explains itself - don't append a canned reason. A real
+            # deployed run refused a Node write and then printed a boilerplate paragraph about
+            # Secrets and RBAC, which had nothing to do with it and was simply wrong.
             fix_result = (
-                "BLOCKED - this fix needs a resource type the agent is not permitted to modify.\n"
+                "BLOCKED - the action was refused and retrying will not change that.\n"
                 + "\n".join(failures)
-                + "\n\nThis is a deliberate safety boundary, not a transient error: Secrets and "
-                "RBAC objects (Role/ClusterRole/RoleBinding/ClusterRoleBinding) are excluded at "
-                "both the tool layer and the ServiceAccount's RBAC, so the agent can never grant "
-                "itself or anything else more permissions. Retrying will not change the outcome - "
-                "a human needs to apply this change directly (e.g. with kubectl)."
             )
         else:
             fix_result = "Remediation FAILED for all actions:\n" + "\n".join(failures)
@@ -733,6 +806,7 @@ def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
         f"3. If the request was to create/scale a resource, confirm the resource now exists with the "
         f"requested spec (e.g. correct replica count, image, namespace).\n"
         f"4. Quote the exact status/state you observed as evidence, including the resource's exact namespace as the object reports it (a namespace called 'max-ns' is not 'max' - do not paraphrase or shorten it; if you looked in the wrong namespace and found nothing, that is NOT evidence the fix worked).\n"
+        f"4a. A RESOURCE BEING GONE IS NOT A FIX. If the pod/deployment/claim you were asked to repair no longer exists, the verdict is GOAL_ACHIEVED: NO - say explicitly that it was deleted and not recreated, and that it must be restored. The ONLY exception is when the user's original request was itself to delete or clean up that resource. Deleting a failing pod does not resolve the failure, it destroys the workload: a real deployed test deleted a Pending standalone pod (nothing recreates a pod with no owner) and reported 'Fixed' because the pod 'is no longer present', leaving the user with nothing at all. Likewise, if a fix was meant to be delete-then-recreate, confirm the REPLACEMENT exists and is Running/Ready - a completed delete with no successful recreate is a failure, not a success.\n"
         f"4b. If the original goal was about PERMISSIONS (\"can-i\", \"not authorized\", \"forbidden\", RBAC), you MUST verify with check_permission for the exact verb/resource/apiGroup/ServiceAccount in question, and the verdict is whatever it returns. Do NOT conclude success from the Role now listing a verb: a rule with the wrong apiGroup (deployments are 'apps', NOT the core \"\" group) or a missing RoleBinding grants nothing, and a real deployed test reported \"Fixed\" on exactly that while `can-i` still said no. Also re-check that any verbs the Role had BEFORE are still present - replacing a rule can silently drop them.\n"
         f"5. Base the verdict ONLY on the live object's current status, never on events - Kubernetes keeps events for about an hour after the fact, so a stale warning does not mean the problem is still there, and the absence of a fresh event does not mean it is fixed. Re-read the actual object. If you cannot find the resource you were supposed to check, say GOAL_ACHIEVED: NO and say you could not find it - never report success for a resource you did not actually observe in a healthy state. A real deployed test had this step report 'the PVC is now Bound' while the live PVC was still Pending and the PV it named had been deleted.\n"
         f"6. ALWAYS write 1-3 plain sentences of findings BEFORE the verdict line - what you checked and what state you saw (e.g. \"The Role 'excel-role' in 'default' now lists verbs get, list, update.\"). The verdict line alone is not an acceptable answer: it is stripped out before the user sees your text, so a reply containing only the verdict shows them a blank result. Write the finding for a human who cannot see any of the tool output.\n"

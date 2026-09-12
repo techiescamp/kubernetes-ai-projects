@@ -197,7 +197,12 @@ def submit_query(request: QueryRequest):
     # Stored WITHOUT "Diagnostic Report:"/"Proposed Fix:" labels: history is replayed into the
     # prompt, and the model copied those labels into its own output, which then got stored again -
     # the UI ended up rendering "Diagnostic Report: Diagnostic Report: ...". Plain prose only.
-    memory.record(query, f"{diag_report}\n\nProposed (awaiting approval): {proposed_fix}")
+    # Only the findings go into history - NOT the proposal. Storing both meant the assistant turn
+    # contained a second labelled section ("Proposed (awaiting approval): ..."), the model saw that
+    # shape in its replayed history and copied it into its next diagnostic report, so the label
+    # showed up mid-report. Same self-reinforcing loop as the old "Diagnostic Report:" doubling:
+    # anything structural stored here comes back as a template the model imitates.
+    memory.record(query, diag_report)
     return {
         "session_id": session_id,
         "remediation_needed": True,

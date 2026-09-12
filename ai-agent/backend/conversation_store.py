@@ -99,10 +99,18 @@ class ConversationStore:
 
     def load_history(self) -> List:
         try:
-            return self._impl.load()
+            history = self._impl.load()
         except Exception as e:
             logger.error(f"Could not load conversation history: {e}")
             return []
+        # Bedrock's Converse API rejects a conversation that starts with an assistant turn
+        # ("A conversation must start with a user message"), which took the whole API down with a
+        # 500. The window can easily begin mid-pair: the MAX_TURNS limit cuts at an arbitrary row,
+        # and deleting rows (e.g. purging contaminated ones) leaves an assistant turn first. Drop
+        # any leading assistant messages so the replayed history always opens with a user turn.
+        while history and not isinstance(history[0], HumanMessage):
+            history.pop(0)
+        return history
 
     def record(self, user_text: str, assistant_text: str) -> None:
         try:
