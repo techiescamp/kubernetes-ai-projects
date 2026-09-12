@@ -9,8 +9,6 @@ from kubernetes.client.rest import ApiException
 
 logger = logging.getLogger(__name__)
 
-# Load kubeconfig. In-cluster config is tried first since that's the expected path when running
-# as a Deployment; local kubeconfig is the fallback for running the agent from a dev machine.
 try:
     config.load_incluster_config()
 except Exception:
@@ -19,42 +17,15 @@ except Exception:
     except Exception as e:
         logger.error(f"Could not load any Kubernetes configuration (in-cluster or kubeconfig): {e}")
 
-# Kinds the generic delete_resource/apply_kubernetes_yaml tools are allowed to touch. Broadened on
-# explicit request after a real deployed test where the agent burned every remediation attempt
-# re-proposing a StorageClass change that was refused here, with no path to ever succeed.
-#
-# Still deliberately EXCLUDES:
-#   - Secret: never created/modified through these generic tools (the code-level guard in
-#     get_resource/list_secrets keeps .data unreadable too) - see k8s/02-rbac.yaml.
-#   - Role/ClusterRole/RoleBinding/ClusterRoleBinding: so the agent can never grant itself or
-#     anything else more permission than it already has. This is the one boundary that stays
-#     closed at BOTH layers (no rbac.authorization.k8s.io write in the ClusterRole either).
-# Everything else the ClusterRole grants is allowed here. Note the real safety gate is the
-# human-approval interrupt in agents.py - nothing in this set is applied without a person
-# approving it first (unless REQUIRE_APPROVAL=false, which is opt-in and documented as risky).
 _ALLOWED_KINDS = {
     "Pod", "Deployment", "Service", "ConfigMap", "PersistentVolumeClaim", "PersistentVolume",
     "Ingress", "Job", "CronJob", "StatefulSet", "DaemonSet", "Namespace",
     "StorageClass", "ReplicaSet", "HorizontalPodAutoscaler", "PodDisruptionBudget",
     "NetworkPolicy", "ServiceAccount", "Endpoints", "ResourceQuota", "LimitRange",
     "PriorityClass", "VolumeAttachment", "CustomResourceDefinition", "ReplicationController",
-    # RBAC and Secrets, added on the owner's explicit instruction ("give all permission to the
-    # agent, i want the agent to be complete k8s issue solver") after RBAC tasks kept hitting a
-    # wall. Understand what this means: the agent can now edit the very objects that define its
-    # own permissions, so RBAC is no longer a boundary on it at all - the human approval gate
-    # (REQUIRE_APPROVAL, on by default) is the only thing standing between a proposed change and
-    # the cluster. Keep that gate on.
     "Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding", "Secret",
-    # Node was missing, which blocked an entirely ordinary fix: labelling a node so a pod with a
-    # nodeSelector can schedule. Nothing about that is dangerous. Deleting a Node IS dangerous and
-    # is refused separately in delete_resource.
     "Node",
 }
-# Case-insensitive lookup -> canonical casing. A real deployed test showed a model calling
-# delete_resource(kind='pod') (lowercase) - Kubernetes `kind` values are always PascalCase, but an
-# LLM-generated free-text argument isn't guaranteed to match that exactly, so the exact-match check
-# rejected a perfectly valid request. Resolve case-insensitively, then use the canonical value for
-# everything downstream (API calls need the exact correct casing).
 _ALLOWED_KINDS_CI = {k.lower(): k for k in _ALLOWED_KINDS}
 
 
@@ -79,14 +50,8 @@ def _api_error_message(e) -> str:
     return f"{getattr(e, 'reason', 'error')} (HTTP {getattr(e, 'status', '?')})"
 
 
-# --- Write guardrails -------------------------------------------------------------------------
-# The agent has cluster-wide write access (see k8s/02-rbac.yaml), with exactly three carve-outs
-# the cluster owner asked for. Kubernetes RBAC has no "deny" rule, so "everything EXCEPT x" cannot
-# be expressed there - these are enforced in code, at the point every write goes through.
 AGENT_NAMESPACE = os.getenv("AGENT_NAMESPACE", "ai-agent")
 AGENT_SERVICE_ACCOUNT = os.getenv("AGENT_SERVICE_ACCOUNT", "ai-agent")
-# Namespaces whose workloads run the cluster itself. Writes here are refused while the target is
-# healthy, and allowed once it is genuinely broken (that's the whole point of the agent).
 PROTECTED_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", AGENT_NAMESPACE}
 _RBAC_KINDS = {"role", "clusterrole", "rolebinding", "clusterrolebinding"}
 _BINDING_KINDS = {"rolebinding", "clusterrolebinding"}
@@ -104,16 +69,13 @@ def _targets_agent_identity(kind: str, name: str, namespace: Optional[str], body
     if k not in _RBAC_KINDS and k != "serviceaccount":
         return False
 
-    # The agent's own ServiceAccount, ClusterRole and ClusterRoleBinding, by name.
     if k == "serviceaccount" and name == AGENT_SERVICE_ACCOUNT and namespace == AGENT_NAMESPACE:
         return True
     if k in ("clusterrole", "clusterrolebinding") and name == AGENT_SERVICE_ACCOUNT:
         return True
-    # Any namespaced RBAC object living in the agent's own namespace.
     if k in ("role", "rolebinding") and namespace == AGENT_NAMESPACE:
         return True
 
-    # Any binding that grants something TO this agent's ServiceAccount, whatever it's called.
     if k in _BINDING_KINDS and isinstance(body, dict):
         for subject in body.get("subjects") or []:
             if not isinstance(subject, dict):
@@ -122,7 +84,6 @@ def _targets_agent_identity(kind: str, name: str, namespace: Optional[str], body
             if s_kind == "serviceaccount" and subject.get("name") == AGENT_SERVICE_ACCOUNT \
                     and subject.get("namespace") == AGENT_NAMESPACE:
                 return True
-            # Group subjects covering every SA in the agent's namespace.
             if s_kind == "group" and AGENT_NAMESPACE in (subject.get("name") or ""):
                 return True
     return False
@@ -161,16 +122,13 @@ def _target_is_unhealthy(kind: str, name: str, namespace: Optional[str]) -> Opti
             return (status.ready_replicas or 0) < desired
     except ApiException as e:
         if e.status == 404:
-            return True  # it's missing - creating/restoring it is legitimate
+            return True
         return None
     except Exception:
         return None
     return None
 
 
-# Container states that are baked into the pod SPEC. Restarting cannot clear any of them - the
-# replacement pod is created from the same spec and fails identically - so a restart proposed as
-# the fix for one of these is always wrong; the spec itself has to be patched.
 _SPEC_BAKED_REASONS = {
     "CreateContainerConfigError": "a referenced ConfigMap/Secret or key is missing or wrong",
     "ImagePullBackOff": "the image cannot be pulled (wrong name/tag or missing credentials)",
@@ -195,7 +153,6 @@ def _restart_would_not_help(pod) -> Optional[str]:
         reason = getattr(waiting, "reason", None) if waiting else None
         if reason in _SPEC_BAKED_REASONS:
             return f"{reason} - {_SPEC_BAKED_REASONS[reason]}"
-    # Pending with no node assigned = unschedulable (nodeSelector/affinity/taints/resources).
     if (pod.status.phase or "") == "Pending" and not (pod.spec.node_name or ""):
         for cond in (pod.status.conditions or []):
             if cond.type == "PodScheduled" and cond.status == "False":
@@ -363,11 +320,6 @@ def get_pod_logs(pod_name: str, namespace: str, container: Optional[str] = None,
 
     try:
         logs = _fetch(previous)
-        # containerd/kubelet sometimes returns this as literal 200 OK "log content" instead of
-        # raising an error, when the previous container's log file is no longer on disk - a real
-        # deployed test caught the model taking this placeholder at face value and giving up
-        # instead of falling back to the current container's logs (which often still has the
-        # crash message, e.g. right after a fast crash-loop restart).
         if previous and logs.strip().startswith("unable to retrieve container logs"):
             current_logs = _fetch(False)
             return (
@@ -510,9 +462,6 @@ def get_cluster_events(namespace: Optional[str] = None) -> str:
 
         import datetime
         now = datetime.datetime.now(datetime.timezone.utc)
-        # Live status is looked up once per distinct object, not per event (the same object
-        # usually produces many repeated warnings), and capped so a noisy cluster can't turn this
-        # into hundreds of API calls.
         status_cache: Dict[str, str] = {}
         lookup_budget = 25
 
@@ -1008,7 +957,7 @@ def _strip_noise(obj: dict) -> dict:
         meta.pop("managedFields", None)
     status = obj.get("status")
     if isinstance(status, dict):
-        status.pop("images", None)  # a Node's cached-image list can be very large and rarely useful
+        status.pop("images", None)
     return obj
 
 
@@ -1032,11 +981,6 @@ def get_resource(kind: str, name: Optional[str] = None, namespace: Optional[str]
       for Secret existence/key checks.
     """
     if kind.strip().lower() in ("secret", "secrets"):
-        # The owner's rule: the agent never reads Secrets in the cluster. Also enforced at the
-        # RBAC layer (no "secrets" get/list verb at all - see k8s/02-rbac.yaml), so this is the
-        # friendly error rather than the actual boundary. list_secrets still reports which Secrets
-        # and key NAMES exist, which is all that's needed to diagnose "secret not found" or "key
-        # missing", and Secrets remain creatable/replaceable.
         return (
             "Error: reading Secrets is not permitted. Use list_secrets to check which Secrets and "
             "key names exist (never their values). You can still CREATE or REPLACE a Secret via "
@@ -1053,8 +997,6 @@ def get_resource(kind: str, name: Optional[str] = None, namespace: Optional[str]
         if name:
             obj = resource.get(name=name, namespace=namespace) if is_namespaced else resource.get(name=name)
             body = _strip_noise(obj.to_dict())
-            # Belt and braces: any object that happens to carry a `data` block of credential-ish
-            # material (a Secret reached some other way, say) never leaves with its values.
             if isinstance(body.get("data"), dict) and (body.get("kind") or "").lower() == "secret":
                 body["data"] = {k: "<redacted>" for k in body["data"]}
             return json.dumps(body, indent=2, default=str)[:8000]
@@ -1112,9 +1054,6 @@ def restart_pod(pod_name: str, namespace: str) -> str:
         if refusal:
             return refusal
         v1 = client.CoreV1Api()
-        # "Restart" here means DELETE, so a standalone pod is destroyed exactly as it would be by
-        # delete_resource - which already refuses this. The same guard has to live here or the
-        # protection is trivially sidestepped by calling restart_pod instead.
         pod = v1.read_namespaced_pod(name=pod_name, namespace=namespace)
         pointless = _restart_would_not_help(pod)
         if pointless:
@@ -1162,11 +1101,6 @@ def update_pod_image(pod_name: str, container_name: str, image: str, namespace: 
     except Exception as e:
         hint = ""
         if "may not add or remove containers" in str(e):
-            # A container list patch with a name that doesn't match any existing container looks
-            # like "add a container" to Kubernetes' strategic merge, which is forbidden on a
-            # running pod - this is almost always a wrong container_name guess, not a real
-            # add/remove attempt. Surface the pod's actual container names so the model can retry
-            # with the correct one in the same turn instead of falling back to delete+recreate.
             try:
                 pod = v1.read_namespaced_pod(name=pod_name, namespace=namespace)
                 real_names = [c.name for c in pod.spec.containers]
@@ -1291,8 +1225,6 @@ def patch_deployment(deployment_name: str, patch: Dict[str, Any], namespace: str
                     if c.get("name") == cpatch.get("name"):
                         _deep_merge(c, cpatch)
                         break
-            # Remove containers from the generic merge below - already applied above by name,
-            # rather than by list position, which the generic merge doesn't know how to do.
             del patch_copy["spec"]["template"]["spec"]["containers"]
 
         _deep_merge(current, patch_copy)
@@ -1318,8 +1250,6 @@ def rollout_restart_deployment(deployment_name: str, namespace: str) -> str:
         refusal = check_write_allowed("Deployment", deployment_name, namespace)
         if refusal:
             return refusal
-        # Same check as restart_pod: rolling the Deployment recreates pods from the SAME template,
-        # so a spec-baked fault survives the rollout untouched.
         try:
             dep = client.AppsV1Api().read_namespaced_deployment(name=deployment_name, namespace=namespace)
             selector = ",".join(f"{k}={v}" for k, v in (dep.spec.selector.match_labels or {}).items())
@@ -1336,7 +1266,7 @@ def rollout_restart_deployment(deployment_name: str, namespace: str) -> str:
                             f"env/volumes/selector), or create the missing dependency."
                         )
         except ApiException:
-            pass  # can't inspect - fall through and let the rollout proceed
+            pass
         import datetime
         apps_v1 = client.AppsV1Api()
         patch = {
@@ -1436,8 +1366,6 @@ def apply_kubernetes_yaml(yaml_content: str, namespace: Optional[str] = None) ->
                     results.append(f"{kind}/{name}: {refusal}")
                     continue
                 if is_namespaced and not doc_namespace:
-                    # Never silently fall back to "default" - see the docstring. Guessing here
-                    # creates the right object in the wrong place and still reports success.
                     results.append(
                         f"{kind}/{name}: REFUSED - no namespace given for a namespaced kind. Set "
                         f"metadata.namespace in the manifest (or pass the namespace argument) to "
@@ -1461,9 +1389,6 @@ def apply_kubernetes_yaml(yaml_content: str, namespace: Optional[str] = None) ->
                                                 content_type="application/merge-patch+json")
                             results.append(f"{kind}/{name}: updated")
                         except ApiException as pe:
-                            # The object already existed and the update was rejected - almost
-                            # always an immutable field. Say so in one actionable line instead of
-                            # surfacing a raw 422 that reads like the create failed.
                             results.append(
                                 f"{kind}/{name}: FAILED - it already exists and could not be "
                                 f"updated in place: {_api_error_message(pe)} "
@@ -1568,10 +1493,6 @@ def delete_resource(kind: str, name: str, namespace: Optional[str] = None,
         from kubernetes.client import api_client
 
         dyn = dynamic.DynamicClient(api_client.ApiClient())
-        # Resolve the kind through the cluster's own API discovery rather than a hardcoded
-        # kind->apiVersion map. The old map covered only the original handful of kinds and would
-        # KeyError outright on anything added to _ALLOWED_KINDS later (StorageClass, HPA, CRDs...),
-        # and it would also silently pin the wrong version on a cluster serving a different one.
         api_version_hints = {
             "Pod": "v1", "Service": "v1", "ConfigMap": "v1", "ServiceAccount": "v1",
             "PersistentVolumeClaim": "v1", "PersistentVolume": "v1", "Namespace": "v1",
@@ -1587,12 +1508,7 @@ def delete_resource(kind: str, name: str, namespace: Optional[str] = None,
         if hint:
             resource = dyn.resources.get(api_version=hint, kind=kind)
         else:
-            # No hint (HPA, PDB, PriorityClass, CRDs, ...) - let discovery find it by kind alone.
             resource = dyn.resources.get(kind=kind)
-        # Cluster-scoped kinds (Namespace, PersistentVolume - not just Namespace, which was the
-        # only one handled before PersistentVolume was added) take no namespace argument at all;
-        # ask the dynamic client's own discovery rather than hardcoding kind names again, so any
-        # future _ALLOWED_KINDS addition doesn't need a matching update here too.
         is_namespaced = getattr(resource, "namespaced", True)
         if is_namespaced and not namespace:
             return (
@@ -1608,11 +1524,6 @@ def delete_resource(kind: str, name: str, namespace: Optional[str] = None,
             )
 
         if kind == "Pod":
-            # A pod with no ownerReferences is not recreated by anything - deleting it destroys
-            # the workload outright. A real deployed run deleted a Pending standalone pod to
-            # "fix" it and then reported success because the pod was "no longer present",
-            # leaving the user with nothing. Deleting one is only ever valid as the first half
-            # of a delete-then-recreate, so require the caller to say that is what it is.
             try:
                 pod = client.CoreV1Api().read_namespaced_pod(name=name, namespace=namespace)
                 if not (pod.metadata.owner_references or []):
@@ -1632,7 +1543,7 @@ def delete_resource(kind: str, name: str, namespace: Optional[str] = None,
                         namespace, name,
                     )
             except ApiException:
-                pass  # already gone / unreadable - let the delete itself report
+                pass
 
         if kind == "PersistentVolume":
             try:
@@ -1648,18 +1559,13 @@ def delete_resource(kind: str, name: str, namespace: Optional[str] = None,
                         f"it; do not delete the one that is already working."
                     )
             except Exception:
-                pass  # couldn't read it - fall through and let the delete itself report the error
+                pass
 
         if is_namespaced:
             resource.delete(name=name, namespace=namespace)
         else:
             resource.delete(name=name)
 
-        # Wait for the object to actually be gone, not just for the delete call to be accepted -
-        # a real deployed test caught a race where a delete+recreate (via apply_kubernetes_yaml)
-        # in the same turn hit the still-terminating old object (finalizer-blocked, e.g. a PVC
-        # still referenced by a pod), got a 409/422, and failed the recreate. Deleting is
-        # asynchronous in Kubernetes; a tool reporting "deleted" should mean it's actually gone.
         import time
         deadline = time.time() + 20
         still_terminating = False
@@ -1679,8 +1585,6 @@ def delete_resource(kind: str, name: str, namespace: Optional[str] = None,
         else:
             still_terminating = True
 
-        # Cluster-scoped objects have no namespace to report - saying "in namespace 'default'"
-        # for a PersistentVolume (as this did before) is just wrong and misleads the model.
         ns_suffix = f" in namespace '{namespace}'" if is_namespaced else ""
         if still_terminating:
             return (

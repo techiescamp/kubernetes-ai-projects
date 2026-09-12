@@ -18,7 +18,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 logger = logging.getLogger(__name__)
 
-# Keep the prompt bounded - only the most recent turns are replayed into the model.
 MAX_TURNS = int(os.getenv("CONVERSATION_HISTORY_TURNS", "20"))
 
 
@@ -56,8 +55,6 @@ class _PostgresStore:
                 "ORDER BY id DESC LIMIT %s) recent ORDER BY id ASC",
                 (MAX_TURNS * 2,),
             ).fetchall()
-        # Labelled so the model can't mistake a past turn for the current request or for live
-        # cluster state - these are a record of the conversation, nothing more.
         return [
             HumanMessage(content=f"[earlier in this conversation] {content}") if role == "user"
             else AIMessage(content=f"[earlier reply - historical, may be out of date] {content}")
@@ -92,8 +89,6 @@ class ConversationStore:
             self._impl = _PostgresStore(pool)
             logger.info("Conversation history backed by Postgres (shared across replicas).")
         except Exception as e:
-            # Never let history storage take the API down - it is a convenience, not core to
-            # diagnosing or fixing anything.
             logger.error(f"Falling back to in-process conversation history: {e}")
             self._impl = _InMemoryStore()
 
@@ -103,28 +98,12 @@ class ConversationStore:
         except Exception as e:
             logger.error(f"Could not load conversation history: {e}")
             return []
-        # Bedrock's Converse API rejects a conversation that starts with an assistant turn
-        # ("A conversation must start with a user message"), which took the whole API down with a
-        # 500. The window can easily begin mid-pair: the MAX_TURNS limit cuts at an arbitrary row,
-        # and deleting rows (e.g. purging contaminated ones) leaves an assistant turn first. Drop
-        # any leading assistant messages so the replayed history always opens with a user turn.
         while history and not isinstance(history[0], HumanMessage):
             history.pop(0)
         return history
 
     def record(self, user_text: str, assistant_text: str) -> None:
         try:
-            # Cap what's stored: callers pass the full report + proposal + execution + verification
-            # text, and every one of those turns is replayed into the next prompt. Left uncapped a
-            # few long troubleshooting turns dominate the context window and the model starts
-            # echoing old transcripts back at the user.
-            # Keep stored turns SHORT. Storing the full report + proposal + YAML + verification
-            # (2000 chars each) actively broke diagnosis once history became durable: 20 such turns
-            # dominated the prompt, and manifests that had merely been *proposed* read as current
-            # cluster state - the model announced a Role was "already updated" when it had never
-            # been applied, and echoed pre-permission-change refusals long after the policy changed.
-            # History exists to answer "what did we do", which a couple of lines covers; live state
-            # must always come from the read tools.
             self._impl.save((user_text or "")[:500], (assistant_text or "")[:500])
         except Exception as e:
             logger.error(f"Could not save conversation history: {e}")

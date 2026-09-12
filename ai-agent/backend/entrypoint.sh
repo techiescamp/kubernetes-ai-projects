@@ -1,6 +1,4 @@
 #!/bin/sh
-# Fail fast and loud on startup misconfiguration (missing env vars, no Kubernetes API access)
-# instead of serving traffic that will only fail on the first real tool call.
 set -e
 
 python -c "

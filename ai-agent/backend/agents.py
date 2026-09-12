@@ -23,7 +23,6 @@ from k8s_tools import (
 
 logger = logging.getLogger(__name__)
 
-# 1. State Definition
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
     user_request: str
@@ -31,29 +30,18 @@ class AgentState(TypedDict):
     remediation_needed: bool
     goal_achieved: bool
     blocked: bool
-    # What the previous attempt(s) tried and why they failed. Kept OUT of diagnostic_report on
-    # purpose: appending it there made the report the user reads grow with every retry, repeating
-    # the whole "Proposed Fix / Execution Result / Verification" block over and over.
     retry_context: str
     issues: List[str]
     proposed_fix: str
-    approval_status: str  # "pending", "approved", "rejected"
+    approval_status: str
     fix_result: str
     verification_result: str
     attempt: int
 
 MAX_ATTEMPTS = int(os.getenv("MAX_REMEDIATION_ATTEMPTS", "3"))
 
-# ConfigMap-driven global toggle (REQUIRE_APPROVAL in k8s/03-configmap.yaml). True (default):
-# every write action pauses for a human decision via POST /api/decision, exactly as before. False:
-# the graph never pauses at all - diagnose -> propose -> apply -> verify -> (retry up to
-# MAX_ATTEMPTS) all run in a single compiled_graph.invoke() call with no human in the loop. This
-# is read once at process startup (like every other ConfigMap value here), so a change requires a
-# pod restart to take effect - `kubectl rollout restart deployment/ai-agent-backend` after editing
-# the ConfigMap, same as changing AWS_REGION or a model ID.
 REQUIRE_APPROVAL = os.getenv("REQUIRE_APPROVAL", "true").lower() != "false"
 
-# 2. Bind Tools to ChatModels
 diag_tools = [
     list_namespaces, get_pod_status, get_pod_logs, get_pod_events, describe_pod,
     get_cluster_events, list_nodes, describe_node, list_deployments, describe_deployment,
@@ -67,7 +55,6 @@ remedy_tools = [
     create_pod, delete_resource,
 ]
 
-# Map tool names to tool functions for execution
 diag_tool_map = {t.name: t for t in diag_tools}
 remedy_tool_map = {t.name: t for t in remedy_tools}
 
@@ -114,10 +101,6 @@ def _strip_reasoning_markup(text: str) -> str:
     text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<thinking>.*$", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"</?response>", "", text, flags=re.IGNORECASE)
-    # Drop section labels the model writes for itself. The UI already puts a heading above each
-    # block, and stored history used to carry the same labels - so the model saw "Diagnostic
-    # Report:" in its own history, copied it, and the result rendered as "Diagnostic Report:
-    # Diagnostic Report: ...". Repeated because the doubling had already crept in.
     for _ in range(3):
         stripped = re.sub(
             r"^\s*(Diagnostic Report|Proposed Fix|Proposed Remediation|Remediation Plan|"
@@ -127,13 +110,10 @@ def _strip_reasoning_markup(text: str) -> str:
         if stripped == text:
             break
         text = stripped
-    # A label mid-text means the model started appending a second section it was never asked for
-    # (copied from the shape of its own stored history) - cut everything from there on.
     text = re.split(
         r"\n\s*(?:Proposed\s*\(awaiting approval\)|Proposed Fix|Proposed Remediation)\s*:",
         text, maxsplit=1, flags=re.IGNORECASE,
     )[0]
-    # Collapse the blank lines the removal leaves behind.
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -178,13 +158,12 @@ def _parse_issues(text: str) -> List[str]:
         stripped = line.strip()
         if not stripped:
             if bullets:
-                break  # blank line ends the list
+                break
             continue
         bullet = re.match(r"^(?:[-*+]|\d+[.)])\s+(.*)$", stripped)
         if not bullet:
-            break  # prose resumed - the list is over
+            break
         bullets.append(bullet.group(1).strip())
-    # One bullet is just a single problem written as a list; no need to ask which to fix.
     return bullets if len(bullets) > 1 else []
 
 
@@ -209,7 +188,7 @@ def _extract_issues_structured(report: str, model) -> List[str]:
         ))])
         record_usage("diagnostics", response)
         raw = clean_message_content(response.content).strip()
-        match = re.search(r"\[.*\]", raw, re.DOTALL)  # tolerate ```json fences / stray prose
+        match = re.search(r"\[.*\]", raw, re.DOTALL)
         if not match:
             return []
         parsed = json.loads(match.group(0))
@@ -230,7 +209,7 @@ def _describe_tool_call(name: str, args: dict) -> str:
     parts = []
     for key, value in sorted(args.items()):
         text = value if isinstance(value, str) else json.dumps(value, default=str)
-        text = " ".join(str(text).split())  # collapse newlines/indentation
+        text = " ".join(str(text).split())
         if len(text) > 80:
             text = text[:77] + "..."
         parts.append(f"{key}={text}")
@@ -263,7 +242,6 @@ def clean_message_content(content) -> str:
         return _strip_reasoning_markup("".join(parts))
     return _strip_reasoning_markup(str(content))
 
-# 3. Define Nodes
 
 @_timed_node("diagnose")
 def diagnose_node(state: AgentState) -> Dict[str, Any]:
@@ -274,8 +252,6 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
     model = get_diagnostics_model()
     model_with_tools = model.bind_tools(diag_tools)
 
-    # Pull the latest human request out of the conversation so it survives into later
-    # nodes even if the model's own report ends up terse (e.g. just the flag line).
     user_request = state.get("user_request", "")
     if not user_request:
         for m in reversed(state["messages"]):
@@ -283,7 +259,6 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
                 user_request = clean_message_content(m.content)
                 break
 
-    # We construct a message sequence
     messages = [
         SystemMessage(content=(
             "You are a Kubernetes Diagnostics Specialist. Your goal is to satisfy the user's request using the provided tools.\n"
@@ -316,15 +291,13 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
         ))
     ] + state["messages"]
 
-    # Run a simple execution loop to allow the agent to call tools
     curr_messages = messages.copy()
-    limit = 8  # bumped from 5 to fit the multi-step investigation procedure (status, logs, describe, events)
+    limit = 8
     for _ in range(limit):
         response = model_with_tools.invoke(curr_messages)
         record_usage("diagnostics", response)
         curr_messages.append(response)
 
-        # If model called tools, execute them and feed results back
         if response.tool_calls:
             for tc in response.tool_calls:
                 tool_func = diag_tool_map.get(tc["name"])
@@ -348,16 +321,8 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
                         additional_kwargs={"tool_call_id": tc["id"]}
                     ))
         else:
-            # No tool calls, we are finished diagnosing
             break
     else:
-        # Loop exhausted `limit` iterations without the model ever stopping to synthesize an
-        # answer (it was still mid-investigation, calling tools every turn) - curr_messages[-1] is
-        # then raw tool output (e.g. a get_resource JSON dump), not analysis. That silently broke
-        # remediation entirely on a real deployed test: no 'REMEDIATION_NEEDED: YES' in the report
-        # means route_after_diagnose sends it straight to END, so a genuinely broken deployment got
-        # reported back to the user as if nothing needed fixing. Force one last no-tools call so
-        # there's always an actual conclusion.
         final = model.invoke(curr_messages + [HumanMessage(content=(
             "You have reached your investigation limit. Based on everything you have found so "
             "far, give your final diagnostic report now - do not call any more tools. End with "
@@ -369,13 +334,6 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
 
     final_response = clean_message_content(curr_messages[-1].content)
 
-    # Safety net for a hard failure mode seen in a real deployed session: asked to CREATE a
-    # deployment and to DELETE some resources, the model answered like a chatbot - "as an AI I do
-    # not have the capability to execute kubectl commands", followed by a command for the user to
-    # run themselves - and ended with REMEDIATION_NEEDED: NO. That routes straight to END, so the
-    # agent silently did nothing at all for a request it is perfectly capable of executing. The
-    # prompt now forbids this explicitly, but a single stray refusal shouldn't be able to no-op the
-    # whole run, so detect that exact signature and make one corrective pass.
     refusal_markers = (
         "do not have the capability", "don't have the capability", "cannot execute",
         "can't execute", "unable to execute", "as an ai", "in your local environment",
@@ -399,30 +357,13 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
         if corrected.strip():
             final_response = corrected
 
-    # user_request is returned as its own state field below (propose_remediation_node and
-    # verify_remediation_node both read it directly) rather than prepended into the report text -
-    # prepending it here used to cause a visible duplicate "User request: ..." in the diagnostic
-    # report shown to the user, since the model's own response sometimes already opens by
-    # restating the request itself.
-    # One line per "ISSUE: ..." the model called out (see prompt guideline 4) - empty when it
-    # found zero or one problem, which is the common case and needs no selection step at all
-    # (route_after_diagnose below only detours through select_issues when this has >1 entry).
-    # Explicit markers are the cheap path; otherwise ask for the list as JSON rather than trying
-    # to guess the report's prose format (see _extract_issues_structured).
     issues = _parse_issues(final_response)
 
-    # Parse the routing flag into real state, then strip it (and the ISSUE: prefixes, which are a
-    # machine-readable marker for the selection UI) out of the prose the user actually reads.
     remediation_needed, final_response = _extract_flag(final_response, "REMEDIATION_NEEDED")
     if remediation_needed and not issues:
         issues = _extract_issues_structured(final_response, model)
-    # Remove the ISSUE: lines from the displayed text entirely. They are a machine-readable
-    # marker: the UI already lists them as selectable checkboxes, and the prose above them says
-    # the same thing, so rendering them as bullets too stated every finding twice.
     final_response = re.sub(r"^ISSUE:\s*.*$\n?", "", final_response, flags=re.MULTILINE)
     if not final_response.strip():
-        # Same failure mode as the verification step: a reply consisting only of the flag line
-        # leaves an empty report once the flag is stripped for display.
         final_response = (
             "A change is needed - see the proposed fix below."
             if remediation_needed else
@@ -551,14 +492,6 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
         }
 
     model = get_remediation_model()
-    # Both write tools (remedy_tools) AND read tools (diag_tools) are bound here - this node used
-    # to only be able to write, blind to the resource's exact current state, and independently
-    # repeated the exact mistake propose_remediation_node used to make (see generate_proposal's
-    # docstring): it constructed a patch_deployment call from the plan's PROSE alone, adding a
-    # correct envFrom but never noticing/clearing a pre-existing broken env entry, because it had
-    # no way to actually look at the container's current spec before writing the patch. Giving it
-    # read tools too closes that gap at the layer that actually matters - the one building the real
-    # tool-call arguments, not just the one describing the plan in English.
     apply_tool_map = {**remedy_tool_map, **diag_tool_map}
     model_with_tools = model.bind_tools(remedy_tools + diag_tools)
 
@@ -607,12 +540,8 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
         )),
         HumanMessage(content=prompt),
     ]
-    limit = 7  # bumped from 5 - a read lookup or two now often precedes the actual write call
-    # (tool_name, args, result) for every tool call that actually executed.
+    limit = 7
     tool_invocations = []
-    # (name, sorted args items) for calls already executed in this turn, so duplicate
-    # tool_calls in the same response (some Bedrock models occasionally emit the same call twice)
-    # aren't re-run against the cluster.
     executed_signatures = set()
     for _ in range(limit):
         response = model_with_tools.invoke(curr_messages)
@@ -621,11 +550,6 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
 
         if response.tool_calls:
             for tc in response.tool_calls:
-                # json.dumps (not tuple(sorted(...items()))) - a tool arg can itself be a dict
-                # (patch_deployment's 'patch' argument), and a tuple containing a nested dict isn't
-                # hashable, which crashed this dedup check with "TypeError: unhashable type: 'dict'"
-                # on a real deployed test the moment the model called patch_deployment. A JSON
-                # string is always hashable regardless of what the args contain.
                 signature = (tc["name"], json.dumps(tc["args"], sort_keys=True, default=str))
                 if signature in executed_signatures:
                     curr_messages.append(HumanMessage(
@@ -639,10 +563,6 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
                     logger.info(f"tool_call remediation {tc['name']} args={tc['args']}")
                     result = invoke_tool_safely(tool_func, tc["args"])
                     record_tool_call(tc["name"], result)
-                    # Only WRITE calls count toward fix_result/tool_invocations (what actually
-                    # changed the cluster) - a read lookup used to check current state first is
-                    # real evidence-gathering, not an "action applied", so it shouldn't be reported
-                    # as one or affect the SUCCEEDED/FAILED classification below.
                     if tc["name"] in remedy_tool_map:
                         tool_invocations.append((tc["name"], tc["args"], result))
                     executed_signatures.add(signature)
@@ -662,9 +582,6 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
                         additional_kwargs={"tool_call_id": tc["id"]}
                     ))
         elif not tool_invocations:
-            # Model responded with prose instead of a tool call (Bedrock's Converse tool_choice
-            # support varies by model, so it can't always be forced) - nudge it and give it
-            # another try rather than trusting whatever text it wrote.
             curr_messages.append(HumanMessage(
                 content=(
                     "You did not call a tool, so NOTHING happened - your text output is discarded "
@@ -684,54 +601,22 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
             "The model only produced text describing what it would run."
         )
     else:
-        # Classify every call, not just failures - a real deployed test caught a case where one
-        # call failed (case-mismatched kind) and a later call in the same turn succeeded (recreated
-        # the pod), but the old logic only ever surfaced the failure list whenever ANY call failed,
-        # silently dropping the successful action from the report entirely - which also skipped
-        # verify_remediation_node (it only runs unless fix_result starts with "Remediation FAILED"),
-        # so a fix that actually worked was reported and treated as a total failure.
         successes, failures = [], []
         blocked_by_policy = False
         for name, args, result in tool_invocations:
             line = f"- {_describe_tool_call(name, args)}\n  {_condense_result(result)}"
             result_lower = str(result).lower()
-            # Checks for "error"/"failed"/"refused" ANYWHERE in the result, not just a leading
-            # "Error" prefix - apply_kubernetes_yaml reports its own per-document failures as
-            # "Kind/name: FAILED - ...", which a startswith("error") check never catches, so a
-            # call whose only outcome was a hard failure still got classified and reported as a
-            # success (confirmed via a real deployed test - see SPEC.md). "refused" was missing
-            # entirely, so a policy-refused call ("kind 'Role' is not in the allowed set") was
-            # counted as a SUCCESS and reported as "Actions Applied" when nothing had happened.
             is_failure = any(w in result_lower for w in ("error", "failed", "refused"))
             if "is not in the allowed set" in result_lower:
                 blocked_by_policy = True
             (failures if is_failure else successes).append(line)
 
         if successes:
-            # Deliberately NOT called "Remediation SUCCEEDED" - that wording claims the underlying
-            # problem is fixed, but all this confirms is that the Kubernetes API call itself didn't
-            # error (e.g. a patch can apply cleanly and still be the wrong patch for the actual
-            # root cause). verify_remediation_node re-inspects the cluster afterward and is the
-            # only step that actually confirms the original goal was achieved - a real deployed
-            # test showed this label being read as "problem solved" even when verification
-            # immediately below it said GOAL_ACHIEVED: NO.
-            # Just the list of what ran - no verdict wording here. Whether the problem is actually
-            # solved is decided by verify_remediation_node, and the UI leads with THAT. This label
-            # used to read "Actions Applied (not yet confirmed - see verification below)", which
-            # looked like a progress/success banner sitting above the real answer.
             status = "Changes made" if not failures else "Changes made (some steps failed)"
             fix_result = f"{status}:\n" + "\n".join(successes)
             if failures:
                 fix_result += "\n\nSteps that failed:\n" + "\n".join(failures)
         elif blocked_by_policy:
-            # A kind outside _ALLOWED_KINDS (Secrets, RBAC objects) will be refused identically
-            # forever - retrying cannot possibly help. A real deployed session burned all three
-            # attempts re-proposing the same Role edit and, in between, flailed into nonsense
-            # (patch_deployment against a Role name, 404). Stop here and tell the human what to
-            # run themselves instead of spending two more attempts and their money on it.
-            # The refusal text already explains itself - don't append a canned reason. A real
-            # deployed run refused a Node write and then printed a boilerplate paragraph about
-            # Secrets and RBAC, which had nothing to do with it and was simply wrong.
             fix_result = (
                 "BLOCKED - the action was refused and retrying will not change that.\n"
                 + "\n".join(failures)
@@ -757,8 +642,6 @@ def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
     """
     fix_result = state.get("fix_result", "")
     if fix_result.startswith("BLOCKED"):
-        # Nothing was applied and nothing can be - don't spend a model call re-inspecting a
-        # cluster that hasn't changed, and don't let route_after_verify queue another attempt.
         return {
             "messages": [AIMessage(content=f"Verification Report:\n{fix_result}")],
             "verification_result": "Not verified - no change was made (see above).",
@@ -775,13 +658,6 @@ def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
         }
 
     import time
-    # 8s was tuned for fast operations (pod restart, image pull) - a real deployed test caught it
-    # being too short for cloud block-storage provisioning (PVC recreate -> Bound -> pod Running
-    # took ~30s total), so verification checked while the fix was still settling and reported
-    # GOAL_ACHIEVED: NO on a fix that had actually already succeeded moments later. The retry loop
-    # doesn't re-diagnose fresh before re-proposing, so a premature "not achieved" here risks the
-    # next attempt undoing a fix that was already working. 15s trades a bit of latency on every
-    # remediation for meaningfully fewer premature-failure verdicts on slower-settling changes.
     time.sleep(15)
 
     model = get_diagnostics_model()
@@ -853,11 +729,6 @@ def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
         else:
             break
     else:
-        # Same failure mode as diagnose_node's loop (see the comment there): if every iteration
-        # up to `limit` used a tool call, curr_messages[-1] is raw tool output with no
-        # 'GOAL_ACHIEVED' line, so "GOAL_ACHIEVED: YES" in verification_result defaults to False -
-        # fails safe here (reports "not achieved" rather than silently skipping remediation like
-        # the diagnose case did), but still isn't a real conclusion. Force one last no-tools call.
         final = model.invoke(curr_messages + [HumanMessage(content=(
             "You have reached your investigation limit. Based on everything you have found so "
             "far, give your final verification verdict now - do not call any more tools. End "
@@ -869,9 +740,6 @@ def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
     verification = clean_message_content(curr_messages[-1].content)
     goal_achieved, verification = _extract_flag(verification, "GOAL_ACHIEVED")
     if not verification.strip():
-        # The model sometimes answers with the verdict line and nothing else; once that line is
-        # stripped out for display there is literally nothing left, and the UI showed a bare
-        # "Verification" heading with no text under it. Say what the verdict means instead.
         verification = (
             "Confirmed against the cluster: the original problem is resolved."
             if goal_achieved else
@@ -898,8 +766,6 @@ def route_after_diagnose(state: AgentState) -> str:
     selection detour first when diagnose_node found more than one distinct issue (single/no-issue
     reports skip straight to propose_remediation exactly as before, no extra step added).
     """
-    # Reads the parsed boolean, not the raw text - the flag line is stripped out of
-    # diagnostic_report before the user ever sees it (see _extract_flag).
     if not state.get("remediation_needed"):
         return END
     if len(state.get("issues", []) or []) > 1:
@@ -915,7 +781,6 @@ def route_after_verify(state: AgentState) -> str:
         REMEDIATION_OUTCOMES.labels(outcome="succeeded").inc()
         return END
     if state.get("blocked"):
-        # Hit a permanent capability boundary (Secrets/RBAC) - more attempts cannot succeed.
         REMEDIATION_OUTCOMES.labels(outcome="blocked").inc()
         return END
     if state.get("attempt", 0) >= MAX_ATTEMPTS:
@@ -924,14 +789,9 @@ def route_after_verify(state: AgentState) -> str:
     REMEDIATION_OUTCOMES.labels(outcome="retrying").inc()
     return "propose_retry"
 
-# 4. Build StateGraph
 
 workflow = StateGraph(AgentState)
 
-# Add Nodes
-# "propose_retry" reuses propose_remediation_node under a distinct name so it can carry
-# its own interrupt: the initial proposal (right after diagnose) needs no separate gate,
-# but every retry proposal needs a "do you want to try again?" pause of its own.
 workflow.add_node("diagnose", diagnose_node)
 workflow.add_node("select_issues", select_issues_node)
 workflow.add_node("propose_remediation", propose_remediation_node)
@@ -939,10 +799,8 @@ workflow.add_node("propose_retry", propose_remediation_node)
 workflow.add_node("apply_remediation", apply_remediation_node)
 workflow.add_node("verify_remediation", verify_remediation_node)
 
-# Set Entry Point
 workflow.set_entry_point("diagnose")
 
-# Add Transitions
 workflow.add_conditional_edges(
     "diagnose",
     route_after_diagnose,
@@ -965,18 +823,6 @@ workflow.add_conditional_edges(
     }
 )
 
-# Checkpointer persists AgentState per thread_id, replacing the manual SESSIONS dict in
-# main.py. interrupt_before freezes execution right before applying a fix (needs approval),
-# right before proposing a retry (needs a "try again?" decision), and right before
-# select_issues (needs an issue-selection decision, only reached at all when diagnose_node found
-# more than one distinct issue - see route_after_diagnose) - main.py resumes each pause with
-# compiled_graph.invoke(None, config) once the human has decided. Skipped entirely when
-# REQUIRE_APPROVAL=false: the graph then never pauses (select_issues still runs, just without a
-# pause, implicitly treating every issue found as selected), so a single compiled_graph.invoke()
-# runs diagnose through verify (and any retries) end to end with no human in the loop - see
-# REQUIRE_APPROVAL above and apply_remediation_node's approval check.
-# build_checkpointer() uses a Postgres-backed saver when DATABASE_URL is set (required for
-# >1 replica / surviving pod restarts), falling back to in-process MemorySaver otherwise.
 checkpointer = build_checkpointer()
 compiled_graph = workflow.compile(
     checkpointer=checkpointer,

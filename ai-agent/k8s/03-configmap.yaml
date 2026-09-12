@@ -6,27 +6,13 @@ metadata:
 data:
   AWS_REGION: "us-west-2"
   DIAGNOSTICS_MODEL_ID: "us.amazon.nova-pro-v1:0"
-  # Was Llama4 Maverick (us.meta.llama4-maverick-17b-instruct-v1:0) - Bedrock rejected it with
-  # "Access to Meta Llama models is not allowed from unsupported countries, regions, or
-  # territories" for this AWS account, confirmed via a real deployed test (see SPEC.md). Nova Pro
-  # works for both roles from the same account/region.
   REMEDIATION_MODEL_ID: "us.amazon.nova-pro-v1:0"
   LOG_LEVEL: "INFO"
   MAX_REMEDIATION_ATTEMPTS: "3"
-  # "true" (default): every write action pauses for a human decision via POST /api/decision.
-  # "false": the agent applies and verifies its own proposed fix with no human in the loop -
-  # diagnose -> propose -> apply -> verify -> retry all run in one request. Read once at backend
-  # startup (agents.py), so changing this needs `kubectl rollout restart deployment/ai-agent-backend`
-  # afterward, same as any other value here.
   REQUIRE_APPROVAL: "true"
-  # Backend Service DNS name from 07-backend-service.yaml - allows the in-cluster frontend origin.
   ALLOWED_ORIGINS: "http://(localhost|127\\.0\\.0\\.1):\\d+|http://ai-agent-frontend(\\.ai-agent)?(\\.svc)?(\\.cluster\\.local)?:\\d+"
-  # Non-secret half of the Postgres connection string - the password lives in secret.yaml.
-  # Combined into DATABASE_URL via a shell-expanded env var in the backend Deployment.
   DATABASE_HOST: "ai-agent-postgres"
   DATABASE_PORT: "5432"
   DATABASE_NAME: "ai_agent"
   DATABASE_USER: "ai_agent"
-  # Read server-side by the frontend's next.config.ts rewrite (not a NEXT_PUBLIC_ var - never
-  # reaches the browser) to proxy the browser's relative /api/* calls to the real backend Service.
   BACKEND_URL: "http://ai-agent-backend:8000"

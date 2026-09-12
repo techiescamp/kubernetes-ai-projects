@@ -21,26 +21,12 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: frontend
-          image: docker.io/devopscube/ai-agent-frontend:v1.4.3
+          image: docker.io/devopscube/ai-agent-frontend:v1.4.4
           ports:
             - containerPort: 3000
           env:
-            # Kubernetes/containerd auto-sets HOSTNAME=<pod-name> in every container; Next.js's
-            # standalone server.js reads that for its bind address, and the pod's own /etc/hosts
-            # entry resolves it to the pod's specific IP rather than 0.0.0.0 - found via a real
-            # deployed test (kubectl port-forward and loopback access both failed with
-            # ECONNREFUSED even though the Service still routed fine, since Service traffic
-            # happens to arrive addressed to that same pod IP). Pin it explicitly instead of
-            # relying on Service routing to mask a wrong bind address.
             - name: HOSTNAME
               value: "0.0.0.0"
-            # Plain runtime env var (not NEXT_PUBLIC_ - never reaches the browser), read
-            # server-side by next.config.ts's rewrite so the Next.js server can proxy /api/*
-            # calls to the real backend. The browser only ever calls relative /api/* paths on
-            # whatever origin served the page - this is what makes the frontend work from a real
-            # browser regardless of how it's reached (port-forward, LoadBalancer, Ingress), unlike
-            # the old build-time NEXT_PUBLIC_BACKEND_URL, which baked in the backend's
-            # cluster-internal DNS name and only worked for callers already inside the cluster.
             - name: BACKEND_URL
               valueFrom: {configMapKeyRef: {name: ai-agent-config, key: BACKEND_URL}}
           securityContext:

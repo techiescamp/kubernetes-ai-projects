@@ -1,18 +1,13 @@
-# Optional - only needed if you want external access via an Ingress controller instead of
-# port-forwarding/kubectl proxy. Replace the placeholder host and TLS secret before applying.
-# The cert-manager annotation is commented since it assumes cert-manager is installed; remove
-# the whole tls: block if you don't need TLS at the ingress.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: ai-agent
   namespace: ai-agent
   annotations: {}
-    # cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
-  ingressClassName: nginx # replace with your cluster's ingress class
+  ingressClassName: nginx
   rules:
-    - host: ai-agent.example.com # replace with your real hostname
+    - host: ai-agent.example.com
       http:
         paths:
           - path: /api
@@ -23,6 +18,3 @@ spec:
             pathType: Prefix
             backend:
               service: {name: ai-agent-frontend, port: {number: 3000}}
-  # tls:
-  #   - hosts: ["ai-agent.example.com"]
-  #     secretName: ai-agent-tls

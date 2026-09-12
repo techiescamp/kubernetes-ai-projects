@@ -5,13 +5,10 @@ from langchain_aws import ChatBedrock, ChatBedrockConverse
 
 load_dotenv()
 
-# Resolve AWS Region and model IDs from the environment (see .env.example)
 AWS_REGION = os.environ["AWS_REGION"]
 DIAGNOSTICS_MODEL_ID = os.environ["DIAGNOSTICS_MODEL_ID"]
 REMEDIATION_MODEL_ID = os.environ["REMEDIATION_MODEL_ID"]
 
-# Create a boto3 Session to automatically resolve credentials from environment variables,
-# IAM roles, or ~/.aws/credentials profiles.
 session = boto3.Session()
 bedrock_client = session.client(
     service_name="bedrock-runtime",

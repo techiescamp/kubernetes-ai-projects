@@ -9,9 +9,6 @@ def _price(env_var: str) -> float:
     return float(os.getenv(env_var, "") or "0")
 
 
-# Optional $/1K-token prices, only used to estimate cost. Leave unset (or blank) to track
-# token counts only - fill these in from the AWS Bedrock pricing page for your region
-# if you want a live cost estimate printed alongside the token counts.
 _PRICING = {
     "diagnostics": {
         "input_per_1k": _price("DIAGNOSTICS_MODEL_PRICE_INPUT_PER_1K"),

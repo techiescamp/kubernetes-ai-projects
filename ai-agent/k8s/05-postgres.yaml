@@ -1,8 +1,3 @@
-# Minimal in-cluster Postgres for LangGraph checkpoint storage (durable session/approval state -
-# see checkpointer.py). Single replica is fine here: it's a checkpoint store, not the primary
-# source of user-facing availability (the backend Deployment's own replicas + probes handle
-# that). For real production use, point DATABASE_URL (k8s/README.md) at a managed RDS/Cloud SQL
-# instance instead and remove this file.
 apiVersion: v1
 kind: Service
 metadata:
@@ -10,7 +5,7 @@ metadata:
   namespace: ai-agent
   labels: {app: ai-agent-postgres}
 spec:
-  clusterIP: None # headless - StatefulSet gets a stable DNS name without needing a real ClusterIP
+  clusterIP: None
   selector: {app: ai-agent-postgres}
   ports:
     - port: 5432
@@ -53,16 +48,10 @@ spec:
             requests: {cpu: 100m, memory: 256Mi}
             limits: {cpu: 500m, memory: 512Mi}
           readinessProbe:
-            # Exec probe commands are passed directly to exec(), not a shell, so $(VAR) env
-            # substitution (which only works in container `env:` values) doesn't apply here -
-            # route through `sh -c` so $POSTGRES_USER actually expands.
             exec: {command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\""]}
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            # Exec probe commands are passed directly to exec(), not a shell, so $(VAR) env
-            # substitution (which only works in container `env:` values) doesn't apply here -
-            # route through `sh -c` so $POSTGRES_USER actually expands.
             exec: {command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\""]}
             initialDelaySeconds: 15
             periodSeconds: 20

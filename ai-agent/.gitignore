@@ -1,14 +1,10 @@
-# Environment variables (contains AWS region/model IDs, potentially credentials/pricing)
 .env
 
-# Python
 __pycache__/
 *.pyc
 
-# Virtual environment
 venv/
 
-# Frontend (Next.js)
 frontend/node_modules/
 frontend/.next/
 frontend/next-env.d.ts

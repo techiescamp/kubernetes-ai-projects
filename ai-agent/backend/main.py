@@ -25,16 +25,12 @@ app = FastAPI(title="Kubernetes Diagnosis & Remediation Agent API", version="1.0
 
 app.add_middleware(
     CORSMiddleware,
-    # Defaults to the Next.js dev server on localhost/127.0.0.1 regardless of port (Next falls
-    # back to 3001, 3002, etc. when 3000 is already taken). Set ALLOWED_ORIGINS in-cluster to the
-    # real frontend origin.
     allow_origin_regex=os.getenv("ALLOWED_ORIGINS", r"http://(localhost|127\.0\.0\.1):\d+"),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Standard Prometheus scrape target.
 app.mount("/metrics", metrics_app)
 
 memory = ConversationStore()
@@ -61,7 +57,7 @@ class GuidanceRequest(BaseModel):
 
 class IssueSelectionRequest(BaseModel):
     session_id: str
-    selected_indices: list[int] = []  # empty/omitted means "fix all issues found"
+    selected_indices: list[int] = []
 
 
 def _get_state(session_id: str):
@@ -137,12 +133,6 @@ def submit_query(request: QueryRequest):
         "attempt": 0,
     }
 
-    # If REQUIRE_APPROVAL=true (default): runs diagnose -> (propose_remediation ->) and freezes
-    # right before apply_remediation if a fix is needed, thanks to interrupt_before in agents.py -
-    # or, if diagnose_node found more than one distinct issue, freezes one step earlier, right
-    # before select_issues, so the human can pick which issue(s) to act on first.
-    # If REQUIRE_APPROVAL=false: nothing to freeze at - this single invoke() runs the whole
-    # diagnose -> propose -> apply -> verify -> retry loop to completion with no human in the loop.
     output_state = compiled_graph.invoke(state, config)
     diag_report = output_state.get("diagnostic_report", "")
     proposed_fix = output_state.get("proposed_fix", "")
@@ -162,8 +152,6 @@ def submit_query(request: QueryRequest):
         }
 
     if not paused and fix_result:
-        # REQUIRE_APPROVAL=false and a fix was actually applied (and possibly retried) - report
-        # the complete outcome in one response, same shape as /api/decision's "done" response.
         goal_achieved = bool(output_state.get("goal_achieved"))
         memory.record(
             query,
@@ -189,19 +177,6 @@ def submit_query(request: QueryRequest):
             "diagnostic_report": diag_report,
         }
 
-    # Record the turn even though it's only paused awaiting approval. Previously history was
-    # written on the non-paused paths only, so the most common outcome of all - "found a problem,
-    # here's the proposed fix" - left no trace, and a later "what did we just look at?" had nothing
-    # to answer from. The diagnosis already happened; that's worth remembering whether or not the
-    # fix is ever approved.
-    # Stored WITHOUT "Diagnostic Report:"/"Proposed Fix:" labels: history is replayed into the
-    # prompt, and the model copied those labels into its own output, which then got stored again -
-    # the UI ended up rendering "Diagnostic Report: Diagnostic Report: ...". Plain prose only.
-    # Only the findings go into history - NOT the proposal. Storing both meant the assistant turn
-    # contained a second labelled section ("Proposed (awaiting approval): ..."), the model saw that
-    # shape in its replayed history and copied it into its next diagnostic report, so the label
-    # showed up mid-report. Same self-reinforcing loop as the old "Diagnostic Report:" doubling:
-    # anything structural stored here comes back as a template the model imitates.
     memory.record(query, diag_report)
     return {
         "session_id": session_id,
@@ -216,9 +191,6 @@ def submit_decision(request: DecisionRequest):
     config, snapshot = _get_state(request.session_id)
     state = snapshot.values
 
-    # A session paused for issue selection has no proposal to approve yet. Without this check the
-    # auto-continue loop below would drive straight through select_issues and apply a fix for
-    # EVERY issue found, silently discarding the choice the user was being asked to make.
     if "select_issues" in (compiled_graph.get_state(config).next or ()):
         raise HTTPException(
             status_code=409,
@@ -235,16 +207,8 @@ def submit_decision(request: DecisionRequest):
         )
         return {"status": "cancelled"}
 
-    # Lift the approval gate and resume: runs apply_remediation -> verify_remediation.
     compiled_graph.update_state(config, {"approval_status": "approved"})
     output_state = compiled_graph.invoke(None, config)
-    # One entry per apply+verify cycle - a real deployed test showed why this matters: with the
-    # auto-continue loop below, a LATER attempt's proposal can take a completely different (and
-    # sometimes worse) approach than an earlier one, but only the FINAL attempt's fix_result used
-    # to be returned - an intermediate attempt that made a harmful or simply wrong change (e.g.
-    # repointing a working reference at the wrong resource) was invisible to the human, who'd only
-    # ever see the last attempt's outcome. Returning the full history makes every attempt's actual
-    # tool calls visible, not just the last one.
     attempt_history = [{
         "attempt": output_state.get("attempt", 0),
         "proposed_fix": output_state.get("proposed_fix", ""),
@@ -252,33 +216,15 @@ def submit_decision(request: DecisionRequest):
         "verification": output_state.get("verification_result", ""),
     }]
 
-    # Once the human has approved once, keep driving the retry loop ourselves instead of pausing
-    # to ask "approve this new attempt too?" every single cycle - a real deployed test showed that
-    # cost two extra clicks (Try New Fix, then Approve again) per retry even though the human's
-    # original "yes, fix it" already covers further attempts at the SAME issue. Runs until the
-    # graph actually finishes (goal achieved or MAX_ATTEMPTS exhausted - both end the graph via
-    # route_after_verify), so this can take a while for a multi-attempt fix. A human who wants a
-    # different approach mid-loop should use /api/guidance instead of approving in the first place.
     while True:
         next_nodes = compiled_graph.get_state(config).next
         if "propose_retry" in next_nodes:
-            # Feed the failed attempt back in as fresh diagnostic evidence before letting
-            # propose_retry generate the next proposal - the manual /api/retry endpoint always did
-            # this, but this auto-continue loop didn't, which was a real bug: propose_retry reuses
-            # propose_remediation_node, so with no updated diagnostic_report it had zero idea the
-            # previous attempt had even happened, let alone failed or why - confirmed via a real
-            # deployed test where all 3 auto-continued attempts proposed the exact same REFUSED
-            # apply_kubernetes_yaml call for a StorageClass, since nothing ever told the model that
-            # call had already been rejected.
             prev = compiled_graph.get_state(config).values
             attempt_note = (
                 f"--- Attempt {prev.get('attempt', 0)} ---\n"
                 f"Applied: {prev.get('fix_result', '')}\n"
                 f"Verification: {prev.get('verification_result', '')}"
             )
-            # Accumulate in retry_context, NOT diagnostic_report - the report is what the user
-            # reads, and folding each attempt into it made every retry repeat the whole previous
-            # transcript back at them.
             compiled_graph.update_state(config, {
                 "retry_context": f"{prev.get('retry_context', '')}\n\n{attempt_note}".strip()
             })
@@ -348,8 +294,6 @@ def submit_retry(request: RetryRequest):
         )
         return {"status": "stopped"}
 
-    # Feed the failed attempt back in as fresh evidence so the next proposal is grounded in what
-    # actually happened - into retry_context, not the user-facing diagnostic_report.
     attempt_note = (
         f"--- Attempt {state.get('attempt', 0)} ---\n"
         f"Applied: {state.get('fix_result', '')}\n"
@@ -359,8 +303,6 @@ def submit_retry(request: RetryRequest):
         "retry_context": f"{state.get('retry_context', '')}\n\n{attempt_note}".strip()
     })
 
-    # Lifts the retry gate and resumes: runs propose_retry, then freezes again right
-    # before apply_remediation, waiting for approval of the new proposal via /api/decision.
     output_state = compiled_graph.invoke(None, config)
 
     return {
@@ -399,9 +341,6 @@ def submit_issue_selection(request: IssueSelectionRequest):
     )
     compiled_graph.update_state(config, {"diagnostic_report": narrowed_report})
 
-    # Lifts the select_issues gate and resumes: runs propose_remediation, then freezes again
-    # right before apply_remediation, waiting for approval via /api/decision - same shape as a
-    # normal single-issue proposal from here on.
     output_state = compiled_graph.invoke(None, config)
 
     return {
@@ -435,10 +374,6 @@ def submit_guidance(request: GuidanceRequest):
     )
 
     if "propose_retry" in next_nodes:
-        # Paused after a failed verification, awaiting a Try New Fix/Stop decision (same state
-        # /api/retry acts on) - fold the instruction in the same way, then let the graph's real
-        # retry node (propose_retry) generate the new proposal so it stays consistent with a
-        # normal retry.
         attempt_note = (
             f"--- Attempt {state.get('attempt', 0)} ---\n"
             f"Applied: {state.get('fix_result', '')}\n"
@@ -456,10 +391,6 @@ def submit_guidance(request: GuidanceRequest):
         }
 
     if "apply_remediation" in next_nodes:
-        # Paused before applying a proposal that hasn't run yet (the very first proposal, or one
-        # already redirected once) - there's no graph node to "go back and re-propose" from here,
-        # so generate the new proposal directly and swap it into state while staying paused at the
-        # same point. A subsequent /api/decision(approved=true) applies THIS new proposal.
         new_context = f"{state.get('retry_context', '')}{guidance_block}".strip()
         new_fix = generate_proposal(
             state.get("diagnostic_report", ""), state.get("user_request", ""), new_context

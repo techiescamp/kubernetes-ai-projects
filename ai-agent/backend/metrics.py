@@ -13,7 +13,6 @@ REMEDIATION_OUTCOMES = Counter(
     "agent_remediation_outcomes_total", "Remediation attempts by final outcome", ["outcome"]
 )
 
-# Mounted at /metrics in main.py - a standard Prometheus scrape target.
 metrics_app = make_asgi_app()
 
 
