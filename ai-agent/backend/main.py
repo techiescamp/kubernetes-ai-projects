@@ -10,9 +10,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from kubernetes import client as k8s_client
 from pydantic import BaseModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 
 from agents import compiled_graph, MAX_ATTEMPTS, REQUIRE_APPROVAL, generate_proposal
+from conversation_store import ConversationStore
 from bedrock_clients import bedrock_client
 from metrics import metrics_app
 from usage_tracker import get_usage_dict
@@ -21,23 +22,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Kubernetes Diagnosis & Remediation Agent API", version="1.0.0")
 
-
-class ConversationMemory:
-    """
-    Minimal in-process replacement for langchain_classic's ConversationBufferMemory (that package
-    only supports the langchain>=1.0 line, which conflicts with the 0.3.x langchain/langchain-aws/
-    langchain-community versions this project is pinned to) - same two methods this app actually
-    uses, nothing else.
-    """
-    def __init__(self):
-        self._messages = []
-
-    def load_memory_variables(self, _inputs):
-        return {"history": list(self._messages)}
-
-    def save_context(self, inputs, outputs):
-        self._messages.append(HumanMessage(content=inputs.get("input", "")))
-        self._messages.append(AIMessage(content=outputs.get("output", "")))
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,7 +37,7 @@ app.add_middleware(
 # Standard Prometheus scrape target.
 app.mount("/metrics", metrics_app)
 
-memory = ConversationMemory()
+memory = ConversationStore()
 
 
 class QueryRequest(BaseModel):
@@ -138,10 +122,12 @@ def submit_query(request: QueryRequest):
     session_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": session_id}}
 
-    history = memory.load_memory_variables({}).get("history", [])
+    history = memory.load_history()
     state = {
         "messages": history + [HumanMessage(content=query)],
         "diagnostic_report": "",
+        "remediation_needed": False,
+        "goal_achieved": False,
         "issues": [],
         "proposed_fix": "",
         "approval_status": "pending",
@@ -177,13 +163,11 @@ def submit_query(request: QueryRequest):
     if not paused and fix_result:
         # REQUIRE_APPROVAL=false and a fix was actually applied (and possibly retried) - report
         # the complete outcome in one response, same shape as /api/decision's "done" response.
-        goal_achieved = "GOAL_ACHIEVED: YES" in verification
-        memory.save_context(
-            {"input": query},
-            {"output": (
-                f"Diagnostic Report:\n{diag_report}\n\nProposed Fix:\n{proposed_fix}\n\n"
-                f"Execution Result:\n{fix_result}\n\nVerification:\n{verification}"
-            )},
+        goal_achieved = bool(output_state.get("goal_achieved"))
+        memory.record(
+            query,
+            f"Diagnostic Report:\n{diag_report}\n\nProposed Fix:\n{proposed_fix}\n\n"
+            f"Execution Result:\n{fix_result}\n\nVerification:\n{verification}",
         )
         return {
             "remediation_needed": True,
@@ -198,12 +182,21 @@ def submit_query(request: QueryRequest):
         }
 
     if not paused:
-        memory.save_context({"input": query}, {"output": diag_report})
+        memory.record(query, diag_report)
         return {
             "remediation_needed": False,
             "diagnostic_report": diag_report,
         }
 
+    # Record the turn even though it's only paused awaiting approval. Previously history was
+    # written on the non-paused paths only, so the most common outcome of all - "found a problem,
+    # here's the proposed fix" - left no trace, and a later "what did we just look at?" had nothing
+    # to answer from. The diagnosis already happened; that's worth remembering whether or not the
+    # fix is ever approved.
+    memory.record(
+        query,
+        f"Diagnostic Report:\n{diag_report}\n\nProposed Fix (awaiting approval):\n{proposed_fix}",
+    )
     return {
         "session_id": session_id,
         "remediation_needed": True,
@@ -218,13 +211,11 @@ def submit_decision(request: DecisionRequest):
     state = snapshot.values
 
     if not request.approved:
-        memory.save_context(
-            {"input": state.get("user_request", "")},
-            {"output": (
-                f"Diagnostic Report:\n{state.get('diagnostic_report', '')}\n\n"
-                f"Proposed Fix:\n{state.get('proposed_fix', '')}\n\n"
-                f"User declined to apply the fix."
-            )},
+        memory.record(
+            state.get("user_request", ""),
+            f"Diagnostic Report:\n{state.get('diagnostic_report', '')}\n\n"
+            f"Proposed Fix:\n{state.get('proposed_fix', '')}\n\n"
+            f"User declined to apply the fix.",
         )
         return {"status": "cancelled"}
 
@@ -268,8 +259,7 @@ def submit_decision(request: DecisionRequest):
                 f"{prev.get('diagnostic_report', '')}\n\n"
                 f"--- Previous fix attempt {prev.get('attempt', 0)} ---\n"
                 f"Applied: {prev.get('fix_result', '')}\n"
-                f"Verification: {prev.get('verification_result', '')}\n"
-                f"REMEDIATION_NEEDED: YES"
+                f"Verification: {prev.get('verification_result', '')}"
             )
             compiled_graph.update_state(config, {"diagnostic_report": updated_report})
             output_state = compiled_graph.invoke(None, config)
@@ -288,20 +278,18 @@ def submit_decision(request: DecisionRequest):
 
     fix_result = output_state.get("fix_result", "")
     verification = output_state.get("verification_result", "")
-    goal_achieved = "GOAL_ACHIEVED: YES" in verification
+    goal_achieved = bool(output_state.get("goal_achieved"))
     attempt = output_state.get("attempt", 0)
 
     paused = bool(compiled_graph.get_state(config).next)
 
     if not paused:
-        memory.save_context(
-            {"input": state.get("user_request", "")},
-            {"output": (
-                f"Diagnostic Report:\n{output_state.get('diagnostic_report', '')}\n\n"
-                f"Proposed Fix:\n{output_state.get('proposed_fix', '')}\n\n"
-                f"Execution Result:\n{fix_result}\n\n"
-                f"Verification:\n{verification}"
-            )},
+        memory.record(
+            state.get("user_request", ""),
+            f"Diagnostic Report:\n{output_state.get('diagnostic_report', '')}\n\n"
+            f"Proposed Fix:\n{output_state.get('proposed_fix', '')}\n\n"
+            f"Execution Result:\n{fix_result}\n\n"
+            f"Verification:\n{verification}",
         )
         return {
             "status": "done",
@@ -330,15 +318,13 @@ def submit_retry(request: RetryRequest):
     state = snapshot.values
 
     if not request.retry:
-        memory.save_context(
-            {"input": state.get("user_request", "")},
-            {"output": (
-                f"Diagnostic Report:\n{state.get('diagnostic_report', '')}\n\n"
-                f"Proposed Fix:\n{state.get('proposed_fix', '')}\n\n"
-                f"Execution Result:\n{state.get('fix_result', '')}\n\n"
-                f"Verification:\n{state.get('verification_result', '')}\n\n"
-                f"User declined to retry after the goal was not confirmed achieved."
-            )},
+        memory.record(
+            state.get("user_request", ""),
+            f"Diagnostic Report:\n{state.get('diagnostic_report', '')}\n\n"
+            f"Proposed Fix:\n{state.get('proposed_fix', '')}\n\n"
+            f"Execution Result:\n{state.get('fix_result', '')}\n\n"
+            f"Verification:\n{state.get('verification_result', '')}\n\n"
+            f"User declined to retry after the goal was not confirmed achieved.",
         )
         return {"status": "stopped"}
 
@@ -348,8 +334,7 @@ def submit_retry(request: RetryRequest):
         f"{state.get('diagnostic_report', '')}\n\n"
         f"--- Previous fix attempt {state.get('attempt', 0)} ---\n"
         f"Applied: {state.get('fix_result', '')}\n"
-        f"Verification: {state.get('verification_result', '')}\n"
-        f"REMEDIATION_NEEDED: YES"
+        f"Verification: {state.get('verification_result', '')}"
     )
     compiled_graph.update_state(config, {"diagnostic_report": updated_report})
 
@@ -390,7 +375,6 @@ def submit_issue_selection(request: IssueSelectionRequest):
         f"following {len(selected)} to fix now - address ONLY these, ignore the rest:\n"
         + "\n".join(f"- {text}" for text in selected)
         + f"\n\nFull original diagnostic context (for reference only):\n{state.get('diagnostic_report', '')}"
-        + f"\n\nREMEDIATION_NEEDED: YES"
     )
     compiled_graph.update_state(config, {"diagnostic_report": narrowed_report})
 
@@ -426,7 +410,7 @@ def submit_guidance(request: GuidanceRequest):
     next_nodes = compiled_graph.get_state(config).next
 
     guidance_block = (
-        f"\n\n--- Human guidance for the next attempt ---\n{instruction}\nREMEDIATION_NEEDED: YES"
+        f"\n\n--- Human guidance for the next attempt ---\n{instruction}"
     )
 
     if "propose_retry" in next_nodes:

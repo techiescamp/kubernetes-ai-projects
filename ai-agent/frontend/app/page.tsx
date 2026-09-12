@@ -46,8 +46,43 @@ export default function Home() {
   const [guidanceInput, setGuidanceInput] = useState("");
   const [issues, setIssues] = useState<string[]>([]);
   const [selectedIssues, setSelectedIssues] = useState<Set<number>>(new Set());
+  const [etaText, setEtaText] = useState("");
+  const [elapsed, setElapsed] = useState(0);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  // Lets the Cancel button abort the in-flight request and hand the UI back to the user.
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Live elapsed-seconds counter, shown next to the ETA while a step is running.
+  useEffect(() => {
+    if (phase !== "busy") {
+      setElapsed(0);
+      return;
+    }
+    const started = Date.now();
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [phase]);
+
+  const beginBusy = (text: string, eta: string) => {
+    setBusyText(text);
+    setEtaText(eta);
+    setPhase("busy");
+    abortRef.current = new AbortController();
+    return abortRef.current.signal;
+  };
+
+  const handleCancel = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    addMessage({
+      role: "ai",
+      text:
+        "Cancelled. Note: a cluster action that was already sent may still finish on the server - " +
+        "re-check the resource before assuming nothing changed.",
+    });
+    setPhase("idle");
+  };
 
   const fetchUsage = useCallback(async () => {
     try {
@@ -77,14 +112,29 @@ export default function Home() {
     const query = input.trim();
     setInput("");
     addMessage({ role: "user", text: query });
-    setPhase("busy");
-    setBusyText("Diagnosing (Nova Pro)...");
+
+    // Multi-task: a new question while an earlier fix is still awaiting your decision simply
+    // abandons that pending proposal and starts fresh, instead of the input staying locked until
+    // you approve or reject it. Nothing was applied for the abandoned one - it only ever paused
+    // before the write step.
+    if (sessionId && (phase === "awaiting_decision" || phase === "awaiting_retry" || phase === "awaiting_issue_selection")) {
+      addMessage({
+        role: "ai",
+        text: "_Previous proposal dropped (nothing was applied) - starting the new request._",
+      });
+      setSessionId(null);
+      setIssues([]);
+      setSelectedIssues(new Set());
+    }
+
+    const signal = beginBusy("Diagnosing the cluster...", "usually 30-60s");
 
     try {
       const res = await fetch(`${backendUrl}/api/query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query }),
+        signal,
       });
       if (!res.ok) throw new Error("Backend query failed");
       const data = await res.json();
@@ -130,6 +180,7 @@ export default function Home() {
       setPhase("awaiting_decision");
       fetchUsage();
     } catch (err) {
+      if ((err as Error)?.name === "AbortError") return; // handleCancel already reported it
       console.error(err);
       addMessage({
         role: "ai",
@@ -141,11 +192,9 @@ export default function Home() {
 
   const handleDecision = async (approved: boolean) => {
     if (!sessionId) return;
-    setPhase("busy");
-    setBusyText(
-      approved
-        ? "Applying remediation - will retry automatically until solved or attempts are exhausted (Nova Pro)..."
-        : "Cancelling..."
+    const signal = beginBusy(
+      approved ? "Applying the fix and verifying it..." : "Cancelling...",
+      approved ? "usually 1-3 min (retries automatically up to 3x)" : "a few seconds"
     );
 
     try {
@@ -153,6 +202,7 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, approved }),
+        signal,
       });
       if (!res.ok) throw new Error("Decision request failed");
       const data = await res.json();
@@ -192,6 +242,7 @@ export default function Home() {
       }
       fetchUsage();
     } catch (err) {
+      if ((err as Error)?.name === "AbortError") return;
       console.error(err);
       addMessage({ role: "ai", text: "Something went wrong applying the fix." });
       setPhase("idle");
@@ -200,14 +251,17 @@ export default function Home() {
 
   const handleRetry = async (retry: boolean) => {
     if (!sessionId) return;
-    setPhase("busy");
-    setBusyText(retry ? "Proposing a new fix (Nova Pro)..." : "Stopping...");
+    const signal = beginBusy(
+      retry ? "Proposing a new fix..." : "Stopping...",
+      retry ? "usually 20-40s" : "a few seconds"
+    );
 
     try {
       const res = await fetch(`${backendUrl}/api/retry`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, retry }),
+        signal,
       });
       if (!res.ok) throw new Error("Retry request failed");
       const data = await res.json();
@@ -227,6 +281,7 @@ export default function Home() {
       setPhase("awaiting_decision");
       fetchUsage();
     } catch (err) {
+      if ((err as Error)?.name === "AbortError") return;
       console.error(err);
       addMessage({ role: "ai", text: "Something went wrong proposing a new fix." });
       setPhase("idle");
@@ -240,14 +295,14 @@ export default function Home() {
 
     setGuidanceInput("");
     addMessage({ role: "user", text: instruction });
-    setPhase("busy");
-    setBusyText("Redirecting the proposed fix with your instruction (Nova Pro)...");
+    const signal = beginBusy("Rethinking the fix with your instruction...", "usually 20-40s");
 
     try {
       const res = await fetch(`${backendUrl}/api/guidance`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, instruction }),
+        signal,
       });
       if (!res.ok) throw new Error("Guidance request failed");
       const data = await res.json();
@@ -259,6 +314,7 @@ export default function Home() {
       setPhase("awaiting_decision");
       fetchUsage();
     } catch (err) {
+      if ((err as Error)?.name === "AbortError") return;
       console.error(err);
       addMessage({ role: "ai", text: "Something went wrong applying your instruction." });
       setPhase("idle");
@@ -267,14 +323,17 @@ export default function Home() {
 
   const handleIssueSelection = async () => {
     if (!sessionId || selectedIssues.size === 0) return;
-    setPhase("busy");
-    setBusyText(`Proposing a fix for ${selectedIssues.size} selected issue(s) (Nova Pro)...`);
+    const signal = beginBusy(
+      `Planning a fix for ${selectedIssues.size} selected issue(s)...`,
+      "usually 20-40s"
+    );
 
     try {
       const res = await fetch(`${backendUrl}/api/select-issues`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, selected_indices: Array.from(selectedIssues) }),
+        signal,
       });
       if (!res.ok) throw new Error("Issue selection request failed");
       const data = await res.json();
@@ -288,6 +347,7 @@ export default function Home() {
       setPhase("awaiting_decision");
       fetchUsage();
     } catch (err) {
+      if ((err as Error)?.name === "AbortError") return;
       console.error(err);
       addMessage({ role: "ai", text: "Something went wrong proposing a fix for the selected issue(s)." });
       setPhase("idle");
@@ -470,9 +530,17 @@ export default function Home() {
             <div className="message-row ai animate-message">
               <div className="message-bubble" style={{ color: "var(--text-muted)" }}>
                 <div className="message-sender">KubeMedic</div>
-                <div style={{ display: "flex", gap: "4px", alignItems: "center" }}>
+                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
                   <span>{busyText}</span>
                   <div className="status-dot running" style={{ width: "6px", height: "6px" }} />
+                </div>
+                <div className="busy-meta">
+                  <span>
+                    {elapsed}s elapsed{etaText ? ` · ${etaText}` : ""}
+                  </span>
+                  <button className="cancel-btn" onClick={handleCancel}>
+                    Cancel
+                  </button>
                 </div>
               </div>
             </div>
@@ -487,11 +555,17 @@ export default function Home() {
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="Describe the Kubernetes issue or ask a question..."
+              placeholder={
+                phase === "busy"
+                  ? "Working... cancel above to type a new request"
+                  : "Describe the Kubernetes issue or ask a question..."
+              }
               className="chat-input"
-              disabled={phase !== "idle"}
+              // Only locked while a request is actually in flight. A pending approval no longer
+              // blocks you from asking something else - sending a new query drops that proposal.
+              disabled={phase === "busy"}
             />
-            <button type="submit" disabled={phase !== "idle" || !input.trim()} className="chat-send-btn">
+            <button type="submit" disabled={phase === "busy" || !input.trim()} className="chat-send-btn">
               &#10148;
             </button>
           </form>

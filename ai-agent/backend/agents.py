@@ -28,6 +28,8 @@ class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
     user_request: str
     diagnostic_report: str
+    remediation_needed: bool
+    goal_achieved: bool
     issues: List[str]
     proposed_fix: str
     approval_status: str  # "pending", "approved", "rejected"
@@ -92,10 +94,73 @@ def invoke_tool_safely(tool_func, args: dict) -> str:
         return f"Error: invalid arguments for this tool call - {e}. Check the tool's required arguments and retry."
 
 
+def _strip_reasoning_markup(text: str) -> str:
+    """
+    Remove the model's internal monologue from anything a human will read.
+
+    Nova Pro wraps its reasoning in <thinking>...</thinking> (and sometimes <response>...</response>)
+    and these were being passed straight through into the diagnostic report, the proposal and the
+    verification text shown in the UI - so users saw the model talking to itself before getting the
+    actual answer. Strip the thinking blocks entirely and unwrap the response tags. An unterminated
+    <thinking> (truncated output) is also dropped rather than leaking a half-thought.
+    """
+    if not text:
+        return text
+    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<thinking>.*$", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"</?response>", "", text, flags=re.IGNORECASE)
+    # Collapse the blank lines the removal leaves behind.
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _extract_flag(text: str, flag: str) -> tuple:
+    """
+    Pull an internal routing flag ('REMEDIATION_NEEDED', 'GOAL_ACHIEVED') out of a model response
+    and return (is_yes, text_without_the_flag_line).
+
+    These flags exist purely so the graph can route; they were never meant for humans, but the raw
+    "REMEDIATION_NEEDED: NO" line was being shown at the bottom of every single chat message. The
+    flag is now parsed into a real state field and stripped from the text the user reads - the UI
+    already conveys the same thing through the proposal/approval buttons and the goal badge.
+    """
+    match = re.search(rf"^\s*{flag}:\s*(YES|NO)\b.*$", text, re.MULTILINE | re.IGNORECASE)
+    is_yes = bool(match) and match.group(1).upper() == "YES"
+    cleaned = re.sub(rf"^\s*{flag}:\s*(YES|NO)\b.*$", "", text, flags=re.MULTILINE | re.IGNORECASE)
+    return is_yes, re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+def _describe_tool_call(name: str, args: dict) -> str:
+    """
+    Render a tool call as one readable line for the human-facing report.
+
+    The old format dumped the raw args dict, which for apply_kubernetes_yaml meant an entire
+    escaped YAML/JSON manifest (hundreds of characters of \\n noise) inline in the chat. Long
+    values are truncated to a short preview; the full detail is still in the logs.
+    """
+    parts = []
+    for key, value in sorted(args.items()):
+        text = value if isinstance(value, str) else json.dumps(value, default=str)
+        text = " ".join(str(text).split())  # collapse newlines/indentation
+        if len(text) > 80:
+            text = text[:77] + "..."
+        parts.append(f"{key}={text}")
+    return f"{name}({', '.join(parts)})"
+
+
+def _condense_result(result) -> str:
+    """
+    Shorten a tool result for display. Tool errors are already one-line since _api_error_message,
+    but anything unexpectedly long (a full object dump) still shouldn't fill the chat window.
+    """
+    text = " ".join(str(result).split())
+    return text if len(text) <= 300 else text[:297] + "..."
+
+
 def clean_message_content(content) -> str:
     """Helper to convert complex message content structures (e.g. block lists) to clean raw strings."""
     if isinstance(content, str):
-        return content
+        return _strip_reasoning_markup(content)
     if isinstance(content, list):
         parts = []
         for block in content:
@@ -106,8 +171,8 @@ def clean_message_content(content) -> str:
                 parts.append(block.text)
             elif isinstance(block, str):
                 parts.append(block)
-        return "".join(parts).strip()
-    return str(content)
+        return _strip_reasoning_markup("".join(parts))
+    return _strip_reasoning_markup(str(content))
 
 # 3. Define Nodes
 
@@ -135,6 +200,7 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
             "You are a Kubernetes Diagnostics Specialist. Your goal is to satisfy the user's request using the provided tools.\n"
             "Guidelines:\n"
             "1. If the user asks for read-only information (e.g. listing pods, namespaces, logs, events, resources), satisfying their request IS your main goal. Retrieve all necessary data using your tools, filter it as requested (e.g. only listing non-running pods, or logs containing specific patterns), and present the answer clearly.\n"
+            "-1. If the user asks about THIS CONVERSATION rather than about the cluster - 'what did we just do', 'what was the last fix', 'what did you change', 'summarise what we've done' - answer from the conversation history you were given above, NOT by calling tools. Cluster events are not a record of what YOU did: they show everything that happened on the cluster from any source, so answering such a question from get_cluster_events is wrong (a real deployed test answered 'the last troubleshooting was scaling ai-agent-frontend' by quoting an unrelated event). If the history does not contain the answer, say plainly that you don't have a record of it in this conversation - do not substitute a guess from events. These questions never need remediation.\n"
             "0. EVENTS ARE HISTORY, NOT CURRENT STATE. Kubernetes keeps events for about an hour AFTER the thing they describe, including after it has been fixed. get_cluster_events/get_pod_events tell you what happened, never what is true right now. You must NEVER conclude that a resource is missing, broken, misconfigured, or unbound from an event alone. Before stating any such thing, read the actual object (get_resource, list_configmaps, list_pvcs, describe_pod, describe_deployment, ...) and base your report on what that returns. A real deployed test had this exact failure: stale events said a ConfigMap was not found, the report repeated it as fact, and the ConfigMap existed the whole time - the 'issue' was already fixed and the agent went on to 'fix' a problem that did not exist. If an event and the live object disagree, the live object is right and the event is stale. Also report the resource's real namespace exactly as the object shows it - do not paraphrase or shorten it (a namespace called 'max-ns' is not 'max').\n"
             "2. If the user asks for the root cause of a crash/failure, you MUST investigate before answering - do not guess or list generic possible causes:\n"
             "   a. Call get_pod_status (or describe_pod) first to see the container's current/last state, exit code, and restart count.\n"
@@ -151,6 +217,7 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
             "   - 'REMEDIATION_NEEDED: YES' (if the user requested a modification/creation, or if there is an active failure/configuration error that requires a write action)\n"
             "   - 'REMEDIATION_NEEDED: NO' (if it's a read-only query, or if all resources are healthy and no changes are needed)\n"
             "   If REMEDIATION_NEEDED is YES and you found MORE THAN ONE distinct problem (different resources and/or unrelated root causes - e.g. one Deployment with a bad ConfigMap reference AND a separate Pod's failing readiness probe), list each one on its own line directly above the REMEDIATION_NEEDED line, prefixed exactly 'ISSUE: ' (one per line, self-contained enough to act on independently - name the resource, namespace, and problem), so a human can choose which one(s) to fix rather than getting them bundled into a single fix. If there's only ONE problem, do not use any ISSUE: lines - just describe it normally in your report.\n"
+            "   A workload that is NOT in a healthy state right now IS an issue - never describe one and then conclude nothing is wrong. Specifically: a Pod that is Pending, ContainerCreating, Init:*, CrashLoopBackOff, Error, ImagePullBackOff/ErrImagePull, Evicted, stuck Terminating, or Running-but-not-Ready (0/1, 1/2); a Deployment/StatefulSet/DaemonSet with fewer ready replicas than desired; a PVC that is Pending; a Job that has failed. 'Pending' and 'ContainerCreating' are NOT benign - a pod stuck in either for more than a couple of minutes means something is actually wrong (unschedulable, no matching node, an unbound PVC, a missing image/ConfigMap/Secret, or a volume that will not attach) and you must investigate it with describe_pod/get_pod_events and report it, including which namespace it is in. The ONLY case where you say nothing is wrong is when every workload you looked at is genuinely healthy right now.\n"
             "   EVERY 'ISSUE:' line must be a problem you confirmed against the LIVE object, not something you saw in an event. Before writing an ISSUE: line, read that object (get_resource/describe_*/list_*) and check it is actually still unhealthy right now. Drop it if the object is gone (the event is stale), or if the object is currently healthy (Bound/Running/Ready - the problem was already fixed and the event is just left over). get_cluster_events annotates each event with 'age' and a live 'object_status' precisely so you can do this - an event whose object_status is GONE must never become an ISSUE. Reporting an already-fixed or non-existent problem as an issue is a serious error: it sends the user to 'fix' something that isn't broken. If after this check nothing is actually wrong, say so and output REMEDIATION_NEEDED: NO.\n"
             "5. Only call tools that were actually given to you via function-calling - never invent a tool name or argument that wasn't provided (e.g. there is no 'list_pods' or 'all_namespaces' argument on any tool). If a tool call comes back 'not found', do not give up or tell the user the capability doesn't exist - retry using one of your real available tools instead. Most read tools accept an optional 'namespace' argument that returns results across ALL namespaces when omitted/left as None.\n"
             "6. To determine whether a pod (or other resource) was created manually vs. by a controller, use describe_pod's 'owner_references'/'standalone_pod' fields - a pod with no owner_references (standalone_pod: true) was created directly (manually, or by a one-off apply), while a pod owned by a ReplicaSet/Deployment/StatefulSet/DaemonSet/Job was created by that controller, not manually.\n"
@@ -250,10 +317,16 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
     # (route_after_diagnose below only detours through select_issues when this has >1 entry).
     issues = re.findall(r"^ISSUE:\s*(.+)$", final_response, re.MULTILINE)
 
+    # Parse the routing flag into real state, then strip it (and the ISSUE: prefixes, which are a
+    # machine-readable marker for the selection UI) out of the prose the user actually reads.
+    remediation_needed, final_response = _extract_flag(final_response, "REMEDIATION_NEEDED")
+    final_response = re.sub(r"^ISSUE:\s*", "- ", final_response, flags=re.MULTILINE)
+
     return {
         "messages": [AIMessage(content=f"Diagnostic Report:\n{final_response}")],
         "user_request": user_request,
         "diagnostic_report": final_response,
+        "remediation_needed": remediation_needed,
         "issues": issues,
     }
 
@@ -389,6 +462,22 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
         f"apply_kubernetes_yaml, create_namespace, create_pod, delete_resource) with the exact values "
         f"needed. Writing out a kubectl command in text does NOT apply anything - only an actual tool "
         f"call changes the cluster.\n"
+        f"KNOW YOUR TARGET BEFORE YOU WRITE. Do not assume what kind of object something is from its "
+        f"name: a name ending in '-pod' is often a bare Pod with no Deployment behind it. If you are "
+        f"not certain of the object's kind, its exact container names, or whether it is controlled by "
+        f"a Deployment, call get_resource/describe_pod FIRST and use what it returns. Pick the pod-level "
+        f"tools (update_pod_image, restart_pod) for a standalone Pod and the Deployment-level ones only "
+        f"when a Deployment genuinely owns it. If a call comes back 404 'not found', the object does not "
+        f"exist under that kind/name - do NOT reissue the same call against the same kind, look up what "
+        f"actually exists instead. A real deployed test wasted an entire attempt calling "
+        f"patch_deployment twice on a name that was only ever a bare Pod.\n"
+        f"When recreating an object from a live one (delete + apply_kubernetes_yaml), write a CLEAN "
+        f"manifest: keep apiVersion/kind/metadata.name/metadata.namespace/labels and the spec fields "
+        f"that matter, and DROP everything the cluster fills in by itself - status, resourceVersion, "
+        f"uid, creationTimestamp, managedFields, nodeName, serviceAccount token volumes/volumeMounts "
+        f"(anything named kube-api-access-*), default tolerations, priority, preemptionPolicy, "
+        f"enableServiceLinks. Copying a live object's full JSON back in verbatim produces a fragile or "
+        f"invalid manifest. Pass it as real YAML, not a single-line JSON blob.\n"
         f"If the fix touches a container's env/envFrom/volumes (attaching, replacing, or clearing a "
         f"ConfigMap/Secret reference) and the plan above doesn't already spell out the container's "
         f"exact current env/envFrom, call get_resource or describe_deployment FIRST (you also have "
@@ -467,7 +556,14 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
             # support varies by model, so it can't always be forced) - nudge it and give it
             # another try rather than trusting whatever text it wrote.
             curr_messages.append(HumanMessage(
-                content="You did not call a tool. Call the appropriate tool function now - do not just describe the command."
+                content=(
+                    "You did not call a tool, so NOTHING happened - your text output is discarded "
+                    "and this counts as a failed attempt. Do not explain, do not apologise, do not "
+                    "restate the plan: emit an actual function call to one of your write tools "
+                    "right now. If you are unsure of a value (a container name, the object's kind), "
+                    "call a read tool such as get_resource or describe_pod first and then make the "
+                    "write call."
+                )
             ))
         else:
             break
@@ -486,7 +582,7 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
         # so a fix that actually worked was reported and treated as a total failure.
         successes, failures = [], []
         for name, args, result in tool_invocations:
-            line = f"{name}({args}) -> {result}"
+            line = f"- {_describe_tool_call(name, args)}\n  {_condense_result(result)}"
             result_lower = str(result).lower()
             # Checks for "error" or "failed" ANYWHERE in the result, not just a leading "Error"
             # prefix - apply_kubernetes_yaml reports its own per-document failures as
@@ -628,9 +724,11 @@ def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
         curr_messages.append(final)
 
     verification = clean_message_content(curr_messages[-1].content)
+    goal_achieved, verification = _extract_flag(verification, "GOAL_ACHIEVED")
     return {
         "messages": [AIMessage(content=f"Verification Report:\n{verification}")],
         "verification_result": verification,
+        "goal_achieved": goal_achieved,
     }
 
 def select_issues_node(state: AgentState) -> Dict[str, Any]:
@@ -648,8 +746,9 @@ def route_after_diagnose(state: AgentState) -> str:
     selection detour first when diagnose_node found more than one distinct issue (single/no-issue
     reports skip straight to propose_remediation exactly as before, no extra step added).
     """
-    report = state.get("diagnostic_report", "")
-    if "REMEDIATION_NEEDED: YES" not in report:
+    # Reads the parsed boolean, not the raw text - the flag line is stripped out of
+    # diagnostic_report before the user ever sees it (see _extract_flag).
+    if not state.get("remediation_needed"):
         return END
     if len(state.get("issues", []) or []) > 1:
         return "select_issues"
@@ -660,7 +759,7 @@ def route_after_verify(state: AgentState) -> str:
     Loops back to propose a new fix if the goal wasn't achieved and attempts remain,
     otherwise finishes.
     """
-    if "GOAL_ACHIEVED: YES" in state.get("verification_result", ""):
+    if state.get("goal_achieved"):
         REMEDIATION_OUTCOMES.labels(outcome="succeeded").inc()
         return END
     if state.get("attempt", 0) >= MAX_ATTEMPTS:

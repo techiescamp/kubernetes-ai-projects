@@ -642,6 +642,36 @@ h1, h2, h3, h4 {
   color: var(--text-primary);
 }
 
+/* Progress row under the "working..." message: elapsed time, rough ETA, and a Cancel button so a
+   long-running step never leaves the user stuck waiting with no way out. */
+.busy-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--panel-border);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.cancel-btn {
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  color: #f87171;
+  border-radius: 8px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--transition-smooth);
+}
+
+.cancel-btn:hover {
+  background: rgba(239, 68, 68, 0.18);
+}
+
 /* Multi-issue selection panel - shown when diagnose found more than one distinct problem, so a
    human can pick which one(s) to fix instead of getting them bundled into a single proposal. */
 .issue-select-panel {

@@ -12,6 +12,15 @@ venv/
 kubeconfig
 *.kubeconfig
 
+# SSH keys - the build host key lives in this directory (release.sh defaults to ./devops-key)
+devops-key
+devops-key.pub
+*.pem
+id_rsa*
+id_ed25519*
+
+# Real secret manifests - only k8s/*-secret.example.yaml should ever be committed
+
 # Frontend (Next.js)
 frontend/node_modules/
 frontend/.next/

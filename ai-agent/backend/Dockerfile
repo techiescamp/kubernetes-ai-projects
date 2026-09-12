@@ -11,8 +11,11 @@ RUN useradd -u 10001 -m appuser
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY agents.py bedrock_clients.py k8s_tools.py main.py usage_tracker.py \
-     checkpointer.py logging_config.py metrics.py entrypoint.sh ./
+# Copy every module rather than an explicit filename list: the list silently went stale the first
+# time a new module was added (conversation_store.py built fine and then crash-looped at import
+# with ModuleNotFoundError, because it simply wasn't in the COPY). .dockerignore keeps tests,
+# caches and local .env out of the image.
+COPY *.py entrypoint.sh ./
 RUN chmod +x entrypoint.sh && chown -R appuser:appuser /app
 
 USER appuser
