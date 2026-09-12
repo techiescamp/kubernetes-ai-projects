@@ -23,7 +23,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: backend
-          image: docker.io/devopscube/ai-agent-backend:v1.0.3
+          image: docker.io/devopscube/ai-agent-backend:v1.2.0
           ports:
             - containerPort: 8000
           env:

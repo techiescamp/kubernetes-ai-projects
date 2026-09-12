@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Any, Dict, Optional
 
 from langchain_core.tools import tool
@@ -37,6 +38,13 @@ _ALLOWED_KINDS = {
     "StorageClass", "ReplicaSet", "HorizontalPodAutoscaler", "PodDisruptionBudget",
     "NetworkPolicy", "ServiceAccount", "Endpoints", "ResourceQuota", "LimitRange",
     "PriorityClass", "VolumeAttachment", "CustomResourceDefinition", "ReplicationController",
+    # RBAC and Secrets, added on the owner's explicit instruction ("give all permission to the
+    # agent, i want the agent to be complete k8s issue solver") after RBAC tasks kept hitting a
+    # wall. Understand what this means: the agent can now edit the very objects that define its
+    # own permissions, so RBAC is no longer a boundary on it at all - the human approval gate
+    # (REQUIRE_APPROVAL, on by default) is the only thing standing between a proposed change and
+    # the cluster. Keep that gate on.
+    "Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding", "Secret",
 }
 # Case-insensitive lookup -> canonical casing. A real deployed test showed a model calling
 # delete_resource(kind='pod') (lowercase) - Kubernetes `kind` values are always PascalCase, but an
@@ -65,6 +73,186 @@ def _api_error_message(e) -> str:
     except Exception:
         pass
     return f"{getattr(e, 'reason', 'error')} (HTTP {getattr(e, 'status', '?')})"
+
+
+# --- Write guardrails -------------------------------------------------------------------------
+# The agent has cluster-wide write access (see k8s/02-rbac.yaml), with exactly three carve-outs
+# the cluster owner asked for. Kubernetes RBAC has no "deny" rule, so "everything EXCEPT x" cannot
+# be expressed there - these are enforced in code, at the point every write goes through.
+AGENT_NAMESPACE = os.getenv("AGENT_NAMESPACE", "ai-agent")
+AGENT_SERVICE_ACCOUNT = os.getenv("AGENT_SERVICE_ACCOUNT", "ai-agent")
+# Namespaces whose workloads run the cluster itself. Writes here are refused while the target is
+# healthy, and allowed once it is genuinely broken (that's the whole point of the agent).
+PROTECTED_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", AGENT_NAMESPACE}
+_RBAC_KINDS = {"role", "clusterrole", "rolebinding", "clusterrolebinding"}
+_BINDING_KINDS = {"rolebinding", "clusterrolebinding"}
+
+
+def _targets_agent_identity(kind: str, name: str, namespace: Optional[str], body: Optional[dict]) -> bool:
+    """
+    True if this write would change the agent's OWN permissions.
+
+    Blocking by object name alone is not enough: the obvious escalation is to create a BRAND NEW
+    ClusterRoleBinding (any name at all) whose subject is this agent's ServiceAccount, bound to
+    cluster-admin. So the subjects of any binding being written are inspected too.
+    """
+    k = (kind or "").lower()
+    if k not in _RBAC_KINDS and k != "serviceaccount":
+        return False
+
+    # The agent's own ServiceAccount, ClusterRole and ClusterRoleBinding, by name.
+    if k == "serviceaccount" and name == AGENT_SERVICE_ACCOUNT and namespace == AGENT_NAMESPACE:
+        return True
+    if k in ("clusterrole", "clusterrolebinding") and name == AGENT_SERVICE_ACCOUNT:
+        return True
+    # Any namespaced RBAC object living in the agent's own namespace.
+    if k in ("role", "rolebinding") and namespace == AGENT_NAMESPACE:
+        return True
+
+    # Any binding that grants something TO this agent's ServiceAccount, whatever it's called.
+    if k in _BINDING_KINDS and isinstance(body, dict):
+        for subject in body.get("subjects") or []:
+            if not isinstance(subject, dict):
+                continue
+            s_kind = (subject.get("kind") or "").lower()
+            if s_kind == "serviceaccount" and subject.get("name") == AGENT_SERVICE_ACCOUNT \
+                    and subject.get("namespace") == AGENT_NAMESPACE:
+                return True
+            # Group subjects covering every SA in the agent's namespace.
+            if s_kind == "group" and AGENT_NAMESPACE in (subject.get("name") or ""):
+                return True
+    return False
+
+
+def _target_is_unhealthy(kind: str, name: str, namespace: Optional[str]) -> Optional[bool]:
+    """
+    Is this object currently broken? None means "couldn't tell".
+
+    Used to allow writes in protected namespaces only once something is actually failing there,
+    which is what the owner asked for: hands off the system components until they break.
+    """
+    k = (kind or "").lower()
+    try:
+        v1 = client.CoreV1Api()
+        apps = client.AppsV1Api()
+        if k == "pod":
+            pod = v1.read_namespaced_pod(name=name, namespace=namespace)
+            if (pod.status.phase or "") not in ("Running", "Succeeded"):
+                return True
+            for cs in (pod.status.container_statuses or []):
+                if not cs.ready or (cs.restart_count or 0) > 3:
+                    return True
+            return False
+        if k in ("deployment", "statefulset", "daemonset"):
+            reader = {
+                "deployment": apps.read_namespaced_deployment,
+                "statefulset": apps.read_namespaced_stateful_set,
+                "daemonset": apps.read_namespaced_daemon_set,
+            }[k]
+            obj = reader(name=name, namespace=namespace)
+            status = obj.status
+            if k == "daemonset":
+                return (status.number_ready or 0) < (status.desired_number_scheduled or 0)
+            desired = (obj.spec.replicas if obj.spec.replicas is not None else 1)
+            return (status.ready_replicas or 0) < desired
+    except ApiException as e:
+        if e.status == 404:
+            return True  # it's missing - creating/restoring it is legitimate
+        return None
+    except Exception:
+        return None
+    return None
+
+
+def check_write_allowed(kind: str, name: str, namespace: Optional[str] = None,
+                        body: Optional[dict] = None) -> Optional[str]:
+    """
+    Gate every write. Returns a refusal message, or None when the write may proceed.
+
+    Three rules, all requested explicitly by the cluster owner:
+      1. Never modify the agent's own RBAC (it must not be able to grant itself more access).
+      2. Never read Secret values (enforced in the read tools; Secrets remain writable).
+      3. Don't touch system namespaces while they are healthy - only once something there is
+         actually broken, which is exactly when the agent is supposed to help.
+    """
+    if _targets_agent_identity(kind, name, namespace, body):
+        return (
+            f"REFUSED: {kind}/{name} controls this agent's own permissions. The agent is not "
+            f"allowed to modify its own RBAC (its ServiceAccount '{AGENT_SERVICE_ACCOUNT}', its "
+            f"ClusterRole/ClusterRoleBinding, anything in the '{AGENT_NAMESPACE}' namespace, or any "
+            f"binding that grants access to it) - that would let it escalate its own privileges. "
+            f"This is permanent, not a transient error: a human must make this change directly. "
+            f"RBAC for every OTHER workload is fully writable."
+        )
+
+    if namespace in PROTECTED_NAMESPACES:
+        unhealthy = _target_is_unhealthy(kind, name, namespace)
+        if unhealthy is False:
+            return (
+                f"REFUSED: {kind}/{name} is in the protected system namespace '{namespace}' and is "
+                f"currently healthy. System components are left alone unless they are actually "
+                f"broken. If you believe it IS broken, show the failing state first "
+                f"(describe_pod/get_pod_events) - the guard allows the write once the object is "
+                f"not Running/Ready or is missing."
+            )
+        if unhealthy is None:
+            return (
+                f"REFUSED: {kind}/{name} is in the protected system namespace '{namespace}' and its "
+                f"health could not be determined, so the write is refused by default. Inspect it "
+                f"first and only act on a confirmed failure."
+            )
+    return None
+
+
+@tool
+def check_permission(verb: str, resource: str, service_account: str, namespace: str,
+                     api_group: str = "", resource_name: Optional[str] = None) -> str:
+    """
+    Answer "can this ServiceAccount do X?" - the API equivalent of
+    `kubectl auth can-i <verb> <resource> --as=system:serviceaccount:<namespace>:<service_account>`.
+    Use it for ANY question about permissions/authorization/RBAC, and ALWAYS use it to verify an
+    RBAC fix: a Role can list the right verb and still not authorize anything if the apiGroup is
+    wrong or no RoleBinding ties it to the ServiceAccount. Checking the Role's rules alone is not
+    proof - this is.
+
+    api_group matters and is easy to get wrong: deployments/statefulsets/daemonsets/replicasets
+    are "apps"; jobs/cronjobs are "batch"; pods/services/configmaps/secrets are "" (core);
+    ingresses/networkpolicies are "networking.k8s.io". A rule with the wrong apiGroup grants
+    nothing, which is exactly the kind of silent failure this tool catches.
+    """
+    try:
+        auth = client.AuthorizationV1Api()
+        review = client.V1SubjectAccessReview(
+            spec=client.V1SubjectAccessReviewSpec(
+                user=f"system:serviceaccount:{namespace}:{service_account}",
+                resource_attributes=client.V1ResourceAttributes(
+                    namespace=namespace,
+                    verb=verb,
+                    group=api_group or "",
+                    resource=resource,
+                    name=resource_name,
+                ),
+            )
+        )
+        result = auth.create_subject_access_review(body=review)
+        allowed = bool(result.status.allowed)
+        detail = result.status.reason or ""
+        who = f"system:serviceaccount:{namespace}:{service_account}"
+        group_label = api_group or "core"
+        return json.dumps({
+            "allowed": allowed,
+            "answer": "yes" if allowed else "no",
+            "subject": who,
+            "checked": f"{verb} {resource} (apiGroup: {group_label}) in namespace {namespace}",
+            "reason": detail,
+            "note": "" if allowed else (
+                "Denied. Check that a Role/ClusterRole grants this verb on this resource with the "
+                "CORRECT apiGroup, and that a RoleBinding/ClusterRoleBinding binds it to this "
+                "ServiceAccount."
+            ),
+        }, indent=2)
+    except Exception as e:
+        return f"Error checking permission for {service_account}: {str(e)}"
 
 
 @tool
@@ -802,7 +990,16 @@ def get_resource(kind: str, name: Optional[str] = None, namespace: Optional[str]
       for Secret existence/key checks.
     """
     if kind.strip().lower() in ("secret", "secrets"):
-        return "Error: use list_secrets instead - this tool never returns Secret data to keep that boundary consistent regardless of how it's asked for."
+        # The owner's rule: the agent never reads Secrets in the cluster. Also enforced at the
+        # RBAC layer (no "secrets" get/list verb at all - see k8s/02-rbac.yaml), so this is the
+        # friendly error rather than the actual boundary. list_secrets still reports which Secrets
+        # and key NAMES exist, which is all that's needed to diagnose "secret not found" or "key
+        # missing", and Secrets remain creatable/replaceable.
+        return (
+            "Error: reading Secrets is not permitted. Use list_secrets to check which Secrets and "
+            "key names exist (never their values). You can still CREATE or REPLACE a Secret via "
+            "apply_kubernetes_yaml if the fix needs one."
+        )
     try:
         from kubernetes import dynamic
         from kubernetes.client import api_client as _api_client
@@ -814,6 +1011,10 @@ def get_resource(kind: str, name: Optional[str] = None, namespace: Optional[str]
         if name:
             obj = resource.get(name=name, namespace=namespace) if is_namespaced else resource.get(name=name)
             body = _strip_noise(obj.to_dict())
+            # Belt and braces: any object that happens to carry a `data` block of credential-ish
+            # material (a Secret reached some other way, say) never leaves with its values.
+            if isinstance(body.get("data"), dict) and (body.get("kind") or "").lower() == "secret":
+                body["data"] = {k: "<redacted>" for k in body["data"]}
             return json.dumps(body, indent=2, default=str)[:8000]
 
         objs = resource.get(namespace=namespace) if (is_namespaced and namespace) else resource.get()
@@ -842,6 +1043,9 @@ def restart_pod(pod_name: str, namespace: str) -> str:
     prefer rollout_restart_deployment instead of deleting the pod directly.
     """
     try:
+        refusal = check_write_allowed("Pod", pod_name, namespace)
+        if refusal:
+            return refusal
         v1 = client.CoreV1Api()
         v1.delete_namespaced_pod(name=pod_name, namespace=namespace)
         return f"Successfully initiated restart (deletion) of pod '{pod_name}' in namespace '{namespace}'."
@@ -859,6 +1063,9 @@ def update_pod_image(pod_name: str, container_name: str, image: str, namespace: 
     reconciles).
     """
     try:
+        refusal = check_write_allowed("Pod", pod_name, namespace)
+        if refusal:
+            return refusal
         v1 = client.CoreV1Api()
         patch = {"spec": {"containers": [{"name": container_name, "image": image}]}}
         v1.patch_namespaced_pod(name=pod_name, namespace=namespace, body=patch)
@@ -909,6 +1116,9 @@ def patch_deployment_image(deployment_name: str, container_name: str, image: str
     directly, this change survives future rollouts and triggers a proper rolling update.
     """
     try:
+        refusal = check_write_allowed("Deployment", deployment_name, namespace)
+        if refusal:
+            return refusal
         apps_v1 = client.AppsV1Api()
         real_names = _real_container_names(apps_v1, deployment_name, namespace)
         if container_name not in real_names:
@@ -969,6 +1179,9 @@ def patch_deployment(deployment_name: str, patch: Dict[str, Any], namespace: str
                 base[key] = value
 
     try:
+        refusal = check_write_allowed("Deployment", deployment_name, namespace)
+        if refusal:
+            return refusal
         apps_v1 = client.AppsV1Api()
         deployment = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
         current = client.ApiClient().sanitize_for_serialization(deployment)
@@ -1016,6 +1229,9 @@ def rollout_restart_deployment(deployment_name: str, namespace: str) -> str:
     normal rolling update.
     """
     try:
+        refusal = check_write_allowed("Deployment", deployment_name, namespace)
+        if refusal:
+            return refusal
         import datetime
         apps_v1 = client.AppsV1Api()
         patch = {
@@ -1041,6 +1257,9 @@ def scale_deployment(deployment_name: str, replicas: int, namespace: str) -> str
     Scale a deployment to the specified number of replicas.
     """
     try:
+        refusal = check_write_allowed("Deployment", deployment_name, namespace)
+        if refusal:
+            return refusal
         apps_v1 = client.AppsV1Api()
         deployment = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
         deployment.spec.replicas = replicas
@@ -1107,6 +1326,10 @@ def apply_kubernetes_yaml(yaml_content: str, namespace: Optional[str] = None) ->
                 resource = dyn.resources.get(api_version=api_version, kind=kind)
                 doc_namespace = doc.get("metadata", {}).get("namespace") or namespace
                 is_namespaced = resource.namespaced if hasattr(resource, "namespaced") else kind != "Namespace"
+                refusal = check_write_allowed(kind, name, doc_namespace, doc)
+                if refusal:
+                    results.append(f"{kind}/{name}: {refusal}")
+                    continue
                 if is_namespaced and not doc_namespace:
                     # Never silently fall back to "default" - see the docstring. Guessing here
                     # creates the right object in the wrong place and still reports success.
@@ -1189,6 +1412,9 @@ def create_pod(pod_name: str, image: str, namespace: str, container_port: Option
     resources or command) apply fine on the recreate.
     """
     try:
+        refusal = check_write_allowed("Pod", pod_name, namespace)
+        if refusal:
+            return refusal
         v1 = client.CoreV1Api()
         container = client.V1Container(
             name=pod_name,
@@ -1224,6 +1450,9 @@ def delete_resource(kind: str, name: str, namespace: Optional[str] = None) -> st
     if not canonical_kind:
         return f"Error: kind '{kind}' is not in the allowed set ({sorted(_ALLOWED_KINDS)})."
     kind = canonical_kind
+    refusal = check_write_allowed(kind, name, namespace)
+    if refusal:
+        return refusal
     try:
         from kubernetes import dynamic
         from kubernetes.client import api_client

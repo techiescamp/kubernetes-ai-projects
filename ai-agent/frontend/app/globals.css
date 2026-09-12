@@ -326,6 +326,7 @@ h1, h2, h3, h4 {
 
 .chat-input-form {
   display: flex;
+  align-items: flex-end; /* keeps the send button pinned to the bottom as the textarea grows */
   width: 100%;
   background: var(--panel-bg);
   border: 1px solid var(--panel-border);
@@ -351,6 +352,13 @@ h1, h2, h3, h4 {
   font-size: 15px;
   outline: none;
   padding: 8px;
+  /* Textarea (not input) so Shift+Enter can add a line. Grows with content up to a cap, then
+     scrolls, instead of pushing the chat off-screen. */
+  resize: none;
+  min-height: 40px;
+  max-height: 180px;
+  line-height: 1.5;
+  overflow-y: auto;
 }
 
 .chat-input::placeholder {

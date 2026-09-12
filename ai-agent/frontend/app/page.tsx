@@ -164,7 +164,9 @@ export default function Home() {
         // approval step, so there's no session to act on - show the complete outcome directly.
         addMessage({
           role: "ai",
-          text: `### Diagnostic Report\n\n${data.diagnostic_report}\n\n### Applied Fix (auto-approved)\n\n${data.proposed_fix}\n\n### Remediation Result\n\n${data.fix_result}\n\n### Verification\n\n${data.verification}`,
+          text: data.goal_achieved
+            ? `### Fixed\n\n${data.verification}`
+            : `### Not fixed\n\n${data.verification}\n\n**What was tried**\n\n${data.fix_result}`,
           goalBadge: data.goal_achieved ? "achieved" : "not-achieved",
         });
         setPhase("idle");
@@ -174,7 +176,7 @@ export default function Home() {
 
       addMessage({
         role: "ai",
-        text: `### Diagnostic Report\n\n${data.diagnostic_report}\n\n### Proposed Remediation\n\n${data.proposed_fix}`,
+        text: `${data.diagnostic_report}\n\n### Proposed Fix\n\n${data.proposed_fix}`,
       });
       setSessionId(data.session_id);
       setPhase("awaiting_decision");
@@ -215,17 +217,16 @@ export default function Home() {
         return;
       }
 
-      const history: AttemptRecord[] = data.attempt_history || [];
-      const resultText =
-        history.length > 1
-          ? history
-              .map(
-                (h, i) =>
-                  `### Attempt ${i + 1}/${history.length}${i === history.length - 1 ? " (final)" : ""}\n\n` +
-                  `**Applied:** ${h.fix_result}\n\n**Verification:** ${h.verification}`
-              )
-              .join("\n\n---\n\n")
-          : `### Remediation Result\n\n${data.fix_result}\n\n### Verification (Nova Pro)\n\n${data.verification}`;
+      // Lead with the VERIFIED outcome, not the intermediate "actions were applied" step - that
+      // read like a success banner while the real answer sat underneath it. What actually changed
+      // goes below, as supporting detail.
+      // On success the verification sentence already states what changed, so the raw tool-call
+      // list is redundant noise (and included failed-but-harmless detours like a 404 or a 409 on
+      // an existing namespace, which look alarming next to a "Fixed" heading). Only show what was
+      // tried when it did NOT work, where it's the useful part.
+      const resultText = data.goal_achieved
+        ? `### Fixed\n\n${data.verification}`
+        : `### Not fixed\n\n${data.verification}\n\n**What was tried**\n\n${data.fix_result}`;
 
       if (data.status === "done") {
         addMessage({
@@ -551,14 +552,27 @@ export default function Home() {
 
         <div className="chat-input-container">
           <form onSubmit={handleSend} className="chat-input-form">
-            <input
-              type="text"
+            <textarea
               value={input}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                setInput(e.target.value);
+                // Grow to fit the typed lines, capped by max-height in CSS.
+                e.target.style.height = "auto";
+                e.target.style.height = `${Math.min(e.target.scrollHeight, 180)}px`;
+              }}
+              onKeyDown={(e) => {
+                // Enter sends, Shift+Enter inserts a newline - so multi-line input (a YAML
+                // snippet, a multi-step request) can be typed without submitting halfway through.
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSend(e);
+                }
+              }}
+              rows={1}
               placeholder={
                 phase === "busy"
                   ? "Working... cancel above to type a new request"
-                  : "Describe the Kubernetes issue or ask a question..."
+                  : "Describe the Kubernetes issue or ask a question...  (Shift+Enter for a new line)"
               }
               className="chat-input"
               // Only locked while a request is actually in flight. A pending approval no longer

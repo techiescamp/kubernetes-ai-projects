@@ -129,6 +129,7 @@ def submit_query(request: QueryRequest):
         "remediation_needed": False,
         "goal_achieved": False,
         "issues": [],
+        "retry_context": "",
         "proposed_fix": "",
         "approval_status": "pending",
         "fix_result": "",
@@ -193,10 +194,10 @@ def submit_query(request: QueryRequest):
     # here's the proposed fix" - left no trace, and a later "what did we just look at?" had nothing
     # to answer from. The diagnosis already happened; that's worth remembering whether or not the
     # fix is ever approved.
-    memory.record(
-        query,
-        f"Diagnostic Report:\n{diag_report}\n\nProposed Fix (awaiting approval):\n{proposed_fix}",
-    )
+    # Stored WITHOUT "Diagnostic Report:"/"Proposed Fix:" labels: history is replayed into the
+    # prompt, and the model copied those labels into its own output, which then got stored again -
+    # the UI ended up rendering "Diagnostic Report: Diagnostic Report: ...". Plain prose only.
+    memory.record(query, f"{diag_report}\n\nProposed (awaiting approval): {proposed_fix}")
     return {
         "session_id": session_id,
         "remediation_needed": True,
@@ -209,6 +210,16 @@ def submit_query(request: QueryRequest):
 def submit_decision(request: DecisionRequest):
     config, snapshot = _get_state(request.session_id)
     state = snapshot.values
+
+    # A session paused for issue selection has no proposal to approve yet. Without this check the
+    # auto-continue loop below would drive straight through select_issues and apply a fix for
+    # EVERY issue found, silently discarding the choice the user was being asked to make.
+    if "select_issues" in (compiled_graph.get_state(config).next or ()):
+        raise HTTPException(
+            status_code=409,
+            detail="This session is waiting for you to choose which issue(s) to fix - "
+                   "call /api/select-issues first.",
+        )
 
     if not request.approved:
         memory.record(
@@ -255,13 +266,17 @@ def submit_decision(request: DecisionRequest):
             # apply_kubernetes_yaml call for a StorageClass, since nothing ever told the model that
             # call had already been rejected.
             prev = compiled_graph.get_state(config).values
-            updated_report = (
-                f"{prev.get('diagnostic_report', '')}\n\n"
-                f"--- Previous fix attempt {prev.get('attempt', 0)} ---\n"
+            attempt_note = (
+                f"--- Attempt {prev.get('attempt', 0)} ---\n"
                 f"Applied: {prev.get('fix_result', '')}\n"
                 f"Verification: {prev.get('verification_result', '')}"
             )
-            compiled_graph.update_state(config, {"diagnostic_report": updated_report})
+            # Accumulate in retry_context, NOT diagnostic_report - the report is what the user
+            # reads, and folding each attempt into it made every retry repeat the whole previous
+            # transcript back at them.
+            compiled_graph.update_state(config, {
+                "retry_context": f"{prev.get('retry_context', '')}\n\n{attempt_note}".strip()
+            })
             output_state = compiled_graph.invoke(None, config)
             next_nodes = compiled_graph.get_state(config).next
         if "apply_remediation" in next_nodes:
@@ -328,15 +343,16 @@ def submit_retry(request: RetryRequest):
         )
         return {"status": "stopped"}
 
-    # Feed the failed attempt back in as fresh diagnostic evidence so the next
-    # proposal is grounded in what actually happened, not a guess.
-    updated_report = (
-        f"{state.get('diagnostic_report', '')}\n\n"
-        f"--- Previous fix attempt {state.get('attempt', 0)} ---\n"
+    # Feed the failed attempt back in as fresh evidence so the next proposal is grounded in what
+    # actually happened - into retry_context, not the user-facing diagnostic_report.
+    attempt_note = (
+        f"--- Attempt {state.get('attempt', 0)} ---\n"
         f"Applied: {state.get('fix_result', '')}\n"
         f"Verification: {state.get('verification_result', '')}"
     )
-    compiled_graph.update_state(config, {"diagnostic_report": updated_report})
+    compiled_graph.update_state(config, {
+        "retry_context": f"{state.get('retry_context', '')}\n\n{attempt_note}".strip()
+    })
 
     # Lifts the retry gate and resumes: runs propose_retry, then freezes again right
     # before apply_remediation, waiting for approval of the new proposal via /api/decision.
@@ -418,13 +434,14 @@ def submit_guidance(request: GuidanceRequest):
         # /api/retry acts on) - fold the instruction in the same way, then let the graph's real
         # retry node (propose_retry) generate the new proposal so it stays consistent with a
         # normal retry.
-        base_report = (
-            f"{state.get('diagnostic_report', '')}\n\n"
-            f"--- Previous fix attempt {state.get('attempt', 0)} ---\n"
+        attempt_note = (
+            f"--- Attempt {state.get('attempt', 0)} ---\n"
             f"Applied: {state.get('fix_result', '')}\n"
             f"Verification: {state.get('verification_result', '')}"
         )
-        compiled_graph.update_state(config, {"diagnostic_report": base_report + guidance_block})
+        compiled_graph.update_state(config, {
+            "retry_context": f"{state.get('retry_context', '')}\n\n{attempt_note}{guidance_block}".strip()
+        })
         output_state = compiled_graph.invoke(None, config)
         return {
             "status": "proposed",
@@ -438,9 +455,11 @@ def submit_guidance(request: GuidanceRequest):
         # already redirected once) - there's no graph node to "go back and re-propose" from here,
         # so generate the new proposal directly and swap it into state while staying paused at the
         # same point. A subsequent /api/decision(approved=true) applies THIS new proposal.
-        new_report = state.get("diagnostic_report", "") + guidance_block
-        new_fix = generate_proposal(new_report, state.get("user_request", ""))
-        compiled_graph.update_state(config, {"diagnostic_report": new_report, "proposed_fix": new_fix})
+        new_context = f"{state.get('retry_context', '')}{guidance_block}".strip()
+        new_fix = generate_proposal(
+            state.get("diagnostic_report", ""), state.get("user_request", ""), new_context
+        )
+        compiled_graph.update_state(config, {"retry_context": new_context, "proposed_fix": new_fix})
         return {
             "status": "proposed",
             "proposed_fix": new_fix,

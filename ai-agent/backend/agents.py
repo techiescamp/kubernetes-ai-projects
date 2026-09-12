@@ -15,7 +15,7 @@ from k8s_tools import (
     get_cluster_events, list_nodes, describe_node, list_deployments, describe_deployment,
     list_replicasets, list_services, list_ingresses, list_configmaps, list_secrets,
     list_pvcs, list_jobs, list_cronjobs, list_statefulsets, list_daemonsets, list_hpas,
-    get_resource_usage, get_resource,
+    get_resource_usage, get_resource, check_permission,
     restart_pod, scale_deployment, apply_kubernetes_yaml, create_namespace, create_pod,
     update_pod_image, patch_deployment_image, patch_deployment, rollout_restart_deployment,
     delete_resource,
@@ -30,6 +30,11 @@ class AgentState(TypedDict):
     diagnostic_report: str
     remediation_needed: bool
     goal_achieved: bool
+    blocked: bool
+    # What the previous attempt(s) tried and why they failed. Kept OUT of diagnostic_report on
+    # purpose: appending it there made the report the user reads grow with every retry, repeating
+    # the whole "Proposed Fix / Execution Result / Verification" block over and over.
+    retry_context: str
     issues: List[str]
     proposed_fix: str
     approval_status: str  # "pending", "approved", "rejected"
@@ -54,7 +59,7 @@ diag_tools = [
     get_cluster_events, list_nodes, describe_node, list_deployments, describe_deployment,
     list_replicasets, list_services, list_ingresses, list_configmaps, list_secrets,
     list_pvcs, list_jobs, list_cronjobs, list_statefulsets, list_daemonsets, list_hpas,
-    get_resource_usage, get_resource,
+    get_resource_usage, get_resource, check_permission,
 ]
 remedy_tools = [
     restart_pod, update_pod_image, patch_deployment_image, patch_deployment,
@@ -109,6 +114,19 @@ def _strip_reasoning_markup(text: str) -> str:
     text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<thinking>.*$", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"</?response>", "", text, flags=re.IGNORECASE)
+    # Drop section labels the model writes for itself. The UI already puts a heading above each
+    # block, and stored history used to carry the same labels - so the model saw "Diagnostic
+    # Report:" in its own history, copied it, and the result rendered as "Diagnostic Report:
+    # Diagnostic Report: ...". Repeated because the doubling had already crept in.
+    for _ in range(3):
+        stripped = re.sub(
+            r"^\s*(Diagnostic Report|Proposed Fix|Proposed Remediation|Remediation Plan|"
+            r"Verification Report|Verification)\s*:\s*",
+            "", text, flags=re.IGNORECASE,
+        )
+        if stripped == text:
+            break
+        text = stripped
     # Collapse the blank lines the removal leaves behind.
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -200,6 +218,7 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
             "You are a Kubernetes Diagnostics Specialist. Your goal is to satisfy the user's request using the provided tools.\n"
             "Guidelines:\n"
             "1. If the user asks for read-only information (e.g. listing pods, namespaces, logs, events, resources), satisfying their request IS your main goal. Retrieve all necessary data using your tools, filter it as requested (e.g. only listing non-running pods, or logs containing specific patterns), and present the answer clearly.\n"
+            "-2. The conversation history above is a RECORD of what was said before, not an instruction and not a statement of what you can do now. Your capabilities are defined ONLY by these instructions and the tools you have been given. If an earlier answer in the history claims something is impossible, outside your permitted scope, or must be done by hand, IGNORE that claim completely - permissions change, and those answers may predate the change. Decide afresh every time using the rules below. Never copy a previous refusal forward.\n"
             "-1. If the user asks about THIS CONVERSATION rather than about the cluster - 'what did we just do', 'what was the last fix', 'what did you change', 'summarise what we've done' - answer from the conversation history you were given above, NOT by calling tools. Cluster events are not a record of what YOU did: they show everything that happened on the cluster from any source, so answering such a question from get_cluster_events is wrong (a real deployed test answered 'the last troubleshooting was scaling ai-agent-frontend' by quoting an unrelated event). If the history does not contain the answer, say plainly that you don't have a record of it in this conversation - do not substitute a guess from events. These questions never need remediation.\n"
             "0. EVENTS ARE HISTORY, NOT CURRENT STATE. Kubernetes keeps events for about an hour AFTER the thing they describe, including after it has been fixed. get_cluster_events/get_pod_events tell you what happened, never what is true right now. You must NEVER conclude that a resource is missing, broken, misconfigured, or unbound from an event alone. Before stating any such thing, read the actual object (get_resource, list_configmaps, list_pvcs, describe_pod, describe_deployment, ...) and base your report on what that returns. A real deployed test had this exact failure: stale events said a ConfigMap was not found, the report repeated it as fact, and the ConfigMap existed the whole time - the 'issue' was already fixed and the agent went on to 'fix' a problem that did not exist. If an event and the live object disagree, the live object is right and the event is stale. Also report the resource's real namespace exactly as the object shows it - do not paraphrase or shorten it (a namespace called 'max-ns' is not 'max').\n"
             "2. If the user asks for the root cause of a crash/failure, you MUST investigate before answering - do not guess or list generic possible causes:\n"
@@ -210,10 +229,12 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
             "   e. Your report must state the EXACT error message, exit code, or reason found in the tool output (quote it), not a hypothetical list of possible causes. Only say the cause is uncertain if the tools genuinely returned no useful evidence after trying (a)-(d).\n"
             "   f. If (a)-(d) don't explain the failure (e.g. the pod spec and container state look correct but something outside the pod itself is the actual cause - blocked by a ResourceQuota/LimitRange, a NetworkPolicy preventing required connectivity, a missing/misconfigured RBAC binding, an admission webhook rejection, a taint with no matching toleration, PriorityClass preemption, etc.), don't stop and call it 'uncertain' - reason about which Kubernetes object type would actually explain it and inspect that with get_resource (it covers ANY kind, not just what has a dedicated tool). You are not limited to the specific tools listed by name in this prompt.\n"
             "3. If the user is reporting a fault/issue, requesting a modification/creation/DELETION (e.g. creating a namespace, creating a deployment, deleting resources, restarting resources, scaling), or if you detect a failing resource, describe EXACTLY what needs to be changed, created or deleted, including any resource names/values the user gave you verbatim (e.g. namespace name, pod name, container image, replica count, deployment name). If the user wants a pod/deployment created but did not specify a container image, pick a sensible default (e.g. 'nginx:latest') and state it explicitly so the Remediation Agent doesn't have to guess. YOU personally only run read tools in THIS step - that does NOT mean the request cannot be carried out. A separate Remediation Agent runs immediately after you and DOES have write tools (create, patch, delete, scale, apply YAML); your job is to hand it a precise instruction. Summarize the requested change in your own report and output 'REMEDIATION_NEEDED: YES' so it can apply it.\n"
+            "   You can write essentially EVERY Kubernetes kind - Deployments, Pods, Services, ConfigMaps, Secrets, PVCs/PVs, StorageClasses, Ingresses, NetworkPolicies, Jobs, HPAs, quotas, CRDs, and RBAC objects (Role, ClusterRole, RoleBinding, ClusterRoleBinding) included - so flag those for remediation rather than telling the user to run kubectl themselves. There are exactly three boundaries: (a) you cannot modify THIS agent's own RBAC (its ServiceAccount/ClusterRole/ClusterRoleBinding, anything in its own namespace, or any binding granting access to it) - everyone else's RBAC is fine; (b) you cannot READ Secret values - list_secrets shows which Secrets and key names exist, which is enough to diagnose 'secret not found' or a missing key, and you can still CREATE/REPLACE a Secret if a fix needs one; (c) workloads in system namespaces (kube-system, kube-public, kube-node-lease and the agent's own namespace) are left alone while they are HEALTHY - if something there is genuinely broken you may and should fix it, but confirm the failing state first with describe_pod/get_pod_events. If a write is refused for one of these reasons, explain which boundary it hit; do not retry it.\n"
             "   NEVER refuse an action request, never say you 'cannot execute commands' or that you are 'just an AI', and NEVER tell the user to go run kubectl themselves - this system executes real changes on the cluster and the user is asking it to act, not asking for instructions. Writing out a kubectl command instead of flagging REMEDIATION_NEEDED: YES is a hard failure: it makes the whole agent do nothing. Any request to create, delete, apply, scale, restart, patch or modify ANYTHING is ALWAYS 'REMEDIATION_NEEDED: YES', even when nothing is broken and even when the user is simply asking for a resource to be created or cleaned up. 'REMEDIATION_NEEDED: NO' is only ever correct for a purely read-only question (listing/describing/explaining) where the user asked for information and no cluster change of any kind was requested.\n"
             "   Match the fix to the ROOT CAUSE, don't default to restarting: if the container state/reason is ImagePullBackOff, ErrImagePull, or InvalidImageName, the fix is to correct the image (state the exact correct image string), NOT to restart/delete the pod - the error is baked into the pod spec and deleting it just fails again the same way (or, if describe_pod shows 'standalone_pod: true' i.e. no owner_references, deleting it PERMANENTLY removes it since nothing recreates it). Only recommend a restart for genuinely transient failures (e.g. a one-off crash where the spec itself is correct).\n"
             "   If describe_pod shows the pod IS owned by a Deployment (owner_references contains a ReplicaSet whose own owner is a Deployment), prefer the Deployment-level tools (patch_deployment_image, rollout_restart_deployment) over the pod-level ones (update_pod_image, restart_pod) - a direct pod-level fix gets overwritten the next time the Deployment's controller reconciles, so it doesn't actually stick. State the Deployment's name (not just the pod's) in that case.\n"
-            "4. Crucial: At the very end of your final response, append exactly one of the following lines:\n"
+            "3b. Keep your report to the ROOT CAUSE and the evidence for it - what is wrong and how you know. Do NOT spell out the remediation plan, the corrected YAML, or the verbs/fields to set: a separate step writes the fix and the user sees it immediately below yours, so describing it here just says the same thing twice in slightly different words. One short sentence naming what needs to change is enough; the details belong to the fix, not the diagnosis. Do not label your own output with headings like 'Diagnostic Report:' - the interface adds those.\n"
+            "4. Crucial: your report must contain your actual findings in plain sentences - the flag line below is stripped out before the user sees your text, so a reply that is ONLY the flag line shows them a blank report. Write for someone who cannot see any of the tool output. Then, at the very end, append exactly one of the following lines:\n"
             "   - 'REMEDIATION_NEEDED: YES' (if the user requested a modification/creation, or if there is an active failure/configuration error that requires a write action)\n"
             "   - 'REMEDIATION_NEEDED: NO' (if it's a read-only query, or if all resources are healthy and no changes are needed)\n"
             "   If REMEDIATION_NEEDED is YES and you found MORE THAN ONE distinct problem (different resources and/or unrelated root causes - e.g. one Deployment with a bad ConfigMap reference AND a separate Pod's failing readiness probe), list each one on its own line directly above the REMEDIATION_NEEDED line, prefixed exactly 'ISSUE: ' (one per line, self-contained enough to act on independently - name the resource, namespace, and problem), so a human can choose which one(s) to fix rather than getting them bundled into a single fix. If there's only ONE problem, do not use any ISSUE: lines - just describe it normally in your report.\n"
@@ -320,7 +341,18 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
     # Parse the routing flag into real state, then strip it (and the ISSUE: prefixes, which are a
     # machine-readable marker for the selection UI) out of the prose the user actually reads.
     remediation_needed, final_response = _extract_flag(final_response, "REMEDIATION_NEEDED")
-    final_response = re.sub(r"^ISSUE:\s*", "- ", final_response, flags=re.MULTILINE)
+    # Remove the ISSUE: lines from the displayed text entirely. They are a machine-readable
+    # marker: the UI already lists them as selectable checkboxes, and the prose above them says
+    # the same thing, so rendering them as bullets too stated every finding twice.
+    final_response = re.sub(r"^ISSUE:\s*.*$\n?", "", final_response, flags=re.MULTILINE)
+    if not final_response.strip():
+        # Same failure mode as the verification step: a reply consisting only of the flag line
+        # leaves an empty report once the flag is stripped for display.
+        final_response = (
+            "A change is needed - see the proposed fix below."
+            if remediation_needed else
+            "No problems found - nothing needs changing."
+        )
 
     return {
         "messages": [AIMessage(content=f"Diagnostic Report:\n{final_response}")],
@@ -330,7 +362,7 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
         "issues": issues,
     }
 
-def generate_proposal(diagnostic_report: str, user_request: str) -> str:
+def generate_proposal(diagnostic_report: str, user_request: str, retry_context: str = "") -> str:
     """
     Core "propose a fix" logic, factored out of propose_remediation_node so main.py's guidance
     endpoint can generate a redirected proposal (incorporating a human's free-text instruction)
@@ -355,7 +387,8 @@ def generate_proposal(diagnostic_report: str, user_request: str) -> str:
         f"propose a precise fix/remediation action.\n\n"
         f"Original user request: {user_request}\n\n"
         f"Diagnostic Report:\n{diagnostic_report}\n\n"
-        f"Instructions:\n"
+        + (f"What has already been tried (do not repeat what failed):\n{retry_context}\n\n" if retry_context else "")
+        + f"Instructions:\n"
         f"1. Be concrete and specific to THIS report only - do not write generic/hypothetical Kubernetes advice or invent scenarios that aren't in the report. If a '--- Human guidance for the next attempt ---' section is present above, that instruction OVERRIDES your own judgment about approach - follow it exactly, only filling in specifics (tool arguments) it left unspecified. If a '--- Previous fix attempt ---' section shows an action that was REFUSED (e.g. 'kind is not in the allowed set') or structurally rejected rather than just not-yet-successful, do NOT propose that exact same action again - it will be refused identically every time, no matter how many attempts remain. Either propose a genuinely different approach that reaches the same goal without the disallowed action, or state plainly that this fix is outside your permitted capability and what a human would need to do manually instead - repeating a known-refused call wastes every remaining attempt.\n"
         f"2. Before finalizing any patch that touches a container's env/envFrom/volumes (attaching, replacing, or removing a ConfigMap/Secret reference), call get_resource or describe_deployment yourself to see that container's CURRENT exact env/envFrom - do not assume the diagnostic report already spelled out every existing entry. If the container already has ANY env/envFrom entry referencing a ConfigMap/Secret that's wrong, stale, or now missing, your patch MUST explicitly clear or correct that existing entry (an empty list removes it) - Kubernetes refuses to start a container while ANY referenced ConfigMap/Secret is missing, even one you're not otherwise touching, so adding a new working reference alongside an untouched broken one does NOT fix anything. Only proceed straight to stating the plan (no tool calls needed) for issues that don't involve env/envFrom/volumes.\n"
         f"3. State exactly which tool you will call and with which arguments (e.g. create_namespace(namespace_name='demo-2') or create_pod(pod_name='test-agent', image='nginx:latest', namespace='demo-2')), using any names/values from the report verbatim. If the report already states a default image to use, use that exact image.\n"
@@ -420,7 +453,9 @@ def propose_remediation_node(state: AgentState) -> Dict[str, Any]:
     Remediation model node (Propose Fix).
     Analyzes the diagnostics report and proposes specific remediation actions.
     """
-    final_response = generate_proposal(state["diagnostic_report"], state.get("user_request", ""))
+    final_response = generate_proposal(
+        state["diagnostic_report"], state.get("user_request", ""), state.get("retry_context", "")
+    )
     return {
         "messages": [AIMessage(content=f"Proposed Remediation:\n{final_response}")],
         "proposed_fix": final_response
@@ -581,16 +616,20 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
         # verify_remediation_node (it only runs unless fix_result starts with "Remediation FAILED"),
         # so a fix that actually worked was reported and treated as a total failure.
         successes, failures = [], []
+        blocked_by_policy = False
         for name, args, result in tool_invocations:
             line = f"- {_describe_tool_call(name, args)}\n  {_condense_result(result)}"
             result_lower = str(result).lower()
-            # Checks for "error" or "failed" ANYWHERE in the result, not just a leading "Error"
-            # prefix - apply_kubernetes_yaml reports its own per-document failures as
+            # Checks for "error"/"failed"/"refused" ANYWHERE in the result, not just a leading
+            # "Error" prefix - apply_kubernetes_yaml reports its own per-document failures as
             # "Kind/name: FAILED - ...", which a startswith("error") check never catches, so a
             # call whose only outcome was a hard failure still got classified and reported as a
-            # success (confirmed via a real deployed test - see SPEC.md). No legitimate success
-            # message in this codebase contains either word, so this is safe in that direction.
-            is_failure = "error" in result_lower or "failed" in result_lower
+            # success (confirmed via a real deployed test - see SPEC.md). "refused" was missing
+            # entirely, so a policy-refused call ("kind 'Role' is not in the allowed set") was
+            # counted as a SUCCESS and reported as "Actions Applied" when nothing had happened.
+            is_failure = any(w in result_lower for w in ("error", "failed", "refused"))
+            if "is not in the allowed set" in result_lower:
+                blocked_by_policy = True
             (failures if is_failure else successes).append(line)
 
         if successes:
@@ -601,16 +640,36 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
             # only step that actually confirms the original goal was achieved - a real deployed
             # test showed this label being read as "problem solved" even when verification
             # immediately below it said GOAL_ACHIEVED: NO.
-            status = "Actions Applied" if not failures else "Actions Partially Applied"
-            fix_result = f"{status} (not yet confirmed - see verification below):\n" + "\n".join(successes)
+            # Just the list of what ran - no verdict wording here. Whether the problem is actually
+            # solved is decided by verify_remediation_node, and the UI leads with THAT. This label
+            # used to read "Actions Applied (not yet confirmed - see verification below)", which
+            # looked like a progress/success banner sitting above the real answer.
+            status = "Changes made" if not failures else "Changes made (some steps failed)"
+            fix_result = f"{status}:\n" + "\n".join(successes)
             if failures:
-                fix_result += "\n\nActions that failed:\n" + "\n".join(failures)
+                fix_result += "\n\nSteps that failed:\n" + "\n".join(failures)
+        elif blocked_by_policy:
+            # A kind outside _ALLOWED_KINDS (Secrets, RBAC objects) will be refused identically
+            # forever - retrying cannot possibly help. A real deployed session burned all three
+            # attempts re-proposing the same Role edit and, in between, flailed into nonsense
+            # (patch_deployment against a Role name, 404). Stop here and tell the human what to
+            # run themselves instead of spending two more attempts and their money on it.
+            fix_result = (
+                "BLOCKED - this fix needs a resource type the agent is not permitted to modify.\n"
+                + "\n".join(failures)
+                + "\n\nThis is a deliberate safety boundary, not a transient error: Secrets and "
+                "RBAC objects (Role/ClusterRole/RoleBinding/ClusterRoleBinding) are excluded at "
+                "both the tool layer and the ServiceAccount's RBAC, so the agent can never grant "
+                "itself or anything else more permissions. Retrying will not change the outcome - "
+                "a human needs to apply this change directly (e.g. with kubectl)."
+            )
         else:
             fix_result = "Remediation FAILED for all actions:\n" + "\n".join(failures)
 
     return {
         "messages": [AIMessage(content=f"Fix Execution Report:\n{fix_result}")],
         "fix_result": fix_result,
+        "blocked": fix_result.startswith("BLOCKED"),
         "attempt": state.get("attempt", 0) + 1,
     }
 
@@ -624,6 +683,14 @@ def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
     and still immediately crash-loop again).
     """
     fix_result = state.get("fix_result", "")
+    if fix_result.startswith("BLOCKED"):
+        # Nothing was applied and nothing can be - don't spend a model call re-inspecting a
+        # cluster that hasn't changed, and don't let route_after_verify queue another attempt.
+        return {
+            "messages": [AIMessage(content=f"Verification Report:\n{fix_result}")],
+            "verification_result": "Not verified - no change was made (see above).",
+            "goal_achieved": False,
+        }
     if fix_result.startswith("Remediation FAILED") or fix_result.startswith("Skipped"):
         verification = (
             f"GOAL_ACHIEVED: NO\n"
@@ -666,8 +733,10 @@ def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
         f"3. If the request was to create/scale a resource, confirm the resource now exists with the "
         f"requested spec (e.g. correct replica count, image, namespace).\n"
         f"4. Quote the exact status/state you observed as evidence, including the resource's exact namespace as the object reports it (a namespace called 'max-ns' is not 'max' - do not paraphrase or shorten it; if you looked in the wrong namespace and found nothing, that is NOT evidence the fix worked).\n"
+        f"4b. If the original goal was about PERMISSIONS (\"can-i\", \"not authorized\", \"forbidden\", RBAC), you MUST verify with check_permission for the exact verb/resource/apiGroup/ServiceAccount in question, and the verdict is whatever it returns. Do NOT conclude success from the Role now listing a verb: a rule with the wrong apiGroup (deployments are 'apps', NOT the core \"\" group) or a missing RoleBinding grants nothing, and a real deployed test reported \"Fixed\" on exactly that while `can-i` still said no. Also re-check that any verbs the Role had BEFORE are still present - replacing a rule can silently drop them.\n"
         f"5. Base the verdict ONLY on the live object's current status, never on events - Kubernetes keeps events for about an hour after the fact, so a stale warning does not mean the problem is still there, and the absence of a fresh event does not mean it is fixed. Re-read the actual object. If you cannot find the resource you were supposed to check, say GOAL_ACHIEVED: NO and say you could not find it - never report success for a resource you did not actually observe in a healthy state. A real deployed test had this step report 'the PVC is now Bound' while the live PVC was still Pending and the PV it named had been deleted.\n"
-        f"6. At the very end of your response, append exactly one line:\n"
+        f"6. ALWAYS write 1-3 plain sentences of findings BEFORE the verdict line - what you checked and what state you saw (e.g. \"The Role 'excel-role' in 'default' now lists verbs get, list, update.\"). The verdict line alone is not an acceptable answer: it is stripped out before the user sees your text, so a reply containing only the verdict shows them a blank result. Write the finding for a human who cannot see any of the tool output.\n"
+        f"7. Then, on the very last line, append exactly one of:\n"
         f"   - 'GOAL_ACHIEVED: YES' if the evidence confirms the original problem is resolved.\n"
         f"   - 'GOAL_ACHIEVED: NO' if the evidence shows it is still failing or you could not confirm it.\n"
     )
@@ -725,6 +794,15 @@ def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
 
     verification = clean_message_content(curr_messages[-1].content)
     goal_achieved, verification = _extract_flag(verification, "GOAL_ACHIEVED")
+    if not verification.strip():
+        # The model sometimes answers with the verdict line and nothing else; once that line is
+        # stripped out for display there is literally nothing left, and the UI showed a bare
+        # "Verification" heading with no text under it. Say what the verdict means instead.
+        verification = (
+            "Confirmed against the cluster: the original problem is resolved."
+            if goal_achieved else
+            "Checked the cluster: the original problem still appears to be present."
+        )
     return {
         "messages": [AIMessage(content=f"Verification Report:\n{verification}")],
         "verification_result": verification,
@@ -761,6 +839,10 @@ def route_after_verify(state: AgentState) -> str:
     """
     if state.get("goal_achieved"):
         REMEDIATION_OUTCOMES.labels(outcome="succeeded").inc()
+        return END
+    if state.get("blocked"):
+        # Hit a permanent capability boundary (Secrets/RBAC) - more attempts cannot succeed.
+        REMEDIATION_OUTCOMES.labels(outcome="blocked").inc()
         return END
     if state.get("attempt", 0) >= MAX_ATTEMPTS:
         REMEDIATION_OUTCOMES.labels(outcome="exhausted").inc()

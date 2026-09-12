@@ -30,9 +30,26 @@ kind: ClusterRole
 metadata:
   name: ai-agent
 rules:
-  # --- Read: everything, including CRDs (see header for the Secret-data trade-off) ---
-  - apiGroups: ["*"]
+  # --- Read ---
+  # Every API group EXCEPT core gets a read wildcard, so get_resource keeps working for any kind
+  # including CRDs without another RBAC edit.
+  - apiGroups: ["apps", "batch", "networking.k8s.io", "storage.k8s.io", "policy", "autoscaling",
+                "apiextensions.k8s.io", "scheduling.k8s.io", "rbac.authorization.k8s.io",
+                "metrics.k8s.io", "coordination.k8s.io", "discovery.k8s.io",
+                "admissionregistration.k8s.io", "apiregistration.k8s.io", "events.k8s.io",
+                "certificates.k8s.io", "node.k8s.io", "flowcontrol.apiserver.k8s.io"]
     resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  # The core group is enumerated so that "secrets" can be left OUT. The cluster owner asked that
+  # the agent never read Secrets in the cluster; RBAC has no "all except" primitive, so the only
+  # way to guarantee it (rather than relying on the code-level guard alone) is to never grant the
+  # verb in the first place. The agent can still CREATE/REPLACE Secrets - see the write rule -
+  # it simply cannot read their contents back.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/status", "services", "configmaps", "nodes",
+                "persistentvolumeclaims", "persistentvolumes", "namespaces", "events",
+                "serviceaccounts", "endpoints", "resourcequotas", "limitranges",
+                "replicationcontrollers", "podtemplates", "componentstatuses"]
     verbs: ["get", "list", "watch"]
 
   # --- Write: broad, per explicit request ("give agent permission for all resources if needed")
@@ -49,18 +66,21 @@ rules:
   # in agents.py, (b) _ALLOWED_KINDS in k8s_tools.py, which is what apply_kubernetes_yaml and
   # delete_resource actually check, and (c) the code-level Secret-data guard. Widen _ALLOWED_KINDS
   # too if you want the agent to be able to act on a kind listed here.
-  # Core group is enumerated rather than "*" specifically to keep "secrets" out of it - RBAC has
-  # no "all resources except X" primitive, so a "*" here would have silently granted secret writes
-  # and quietly removed a boundary the curated list used to enforce.
-  - apiGroups: [""]
-    resources: ["pods", "services", "configmaps", "persistentvolumeclaims", "persistentvolumes",
-                "namespaces", "serviceaccounts", "endpoints", "resourcequotas", "limitranges",
-                "replicationcontrollers", "podtemplates"]
-    verbs: ["create", "update", "patch", "delete"]
-  # These groups contain no Secret-equivalent, so a wildcard is fine and keeps new kinds working
-  # without another RBAC edit.
-  - apiGroups: ["apps", "batch", "networking.k8s.io", "storage.k8s.io", "policy",
-                "autoscaling", "apiextensions.k8s.io", "scheduling.k8s.io"]
+  # Full write access across every API group, INCLUDING rbac.authorization.k8s.io and secrets,
+  # granted on the cluster owner's explicit instruction ("give all permission to the agent, i want
+  # the agent to be complete k8s issue solver").
+  #
+  # Be clear about what this costs: the agent can now edit Roles/ClusterRoles/Bindings, which are
+  # the objects that define its own permissions. It can therefore grant itself anything, so this
+  # ClusterRole is no longer a meaningful boundary on what an approved action can do. The real -
+  # and now only - control is the human approval interrupt in agents.py (REQUIRE_APPROVAL, "true"
+  # in k8s/03-configmap.yaml). Setting REQUIRE_APPROVAL=false together with this grant means an
+  # LLM can make arbitrary changes to the cluster, including to its own access, unsupervised.
+  #
+  # To narrow it again, replace the rule below with a per-group list omitting
+  # rbac.authorization.k8s.io and "secrets" (see git history for the previous curated version) and
+  # drop Role/ClusterRole/RoleBinding/ClusterRoleBinding/Secret from _ALLOWED_KINDS in k8s_tools.py.
+  - apiGroups: ["*"]
     resources: ["*"]
     verbs: ["create", "update", "patch", "delete"]
 ---

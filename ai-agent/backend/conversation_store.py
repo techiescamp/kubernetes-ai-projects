@@ -56,8 +56,11 @@ class _PostgresStore:
                 "ORDER BY id DESC LIMIT %s) recent ORDER BY id ASC",
                 (MAX_TURNS * 2,),
             ).fetchall()
+        # Labelled so the model can't mistake a past turn for the current request or for live
+        # cluster state - these are a record of the conversation, nothing more.
         return [
-            HumanMessage(content=content) if role == "user" else AIMessage(content=content)
+            HumanMessage(content=f"[earlier in this conversation] {content}") if role == "user"
+            else AIMessage(content=f"[earlier reply - historical, may be out of date] {content}")
             for role, content in rows
         ]
 
@@ -103,6 +106,17 @@ class ConversationStore:
 
     def record(self, user_text: str, assistant_text: str) -> None:
         try:
-            self._impl.save(user_text or "", assistant_text or "")
+            # Cap what's stored: callers pass the full report + proposal + execution + verification
+            # text, and every one of those turns is replayed into the next prompt. Left uncapped a
+            # few long troubleshooting turns dominate the context window and the model starts
+            # echoing old transcripts back at the user.
+            # Keep stored turns SHORT. Storing the full report + proposal + YAML + verification
+            # (2000 chars each) actively broke diagnosis once history became durable: 20 such turns
+            # dominated the prompt, and manifests that had merely been *proposed* read as current
+            # cluster state - the model announced a Role was "already updated" when it had never
+            # been applied, and echoed pre-permission-change refusals long after the policy changed.
+            # History exists to answer "what did we do", which a couple of lines covers; live state
+            # must always come from the read tools.
+            self._impl.save((user_text or "")[:500], (assistant_text or "")[:500])
         except Exception as e:
             logger.error(f"Could not save conversation history: {e}")
