@@ -464,11 +464,6 @@ export default function Home() {
       </aside>
 
       <main className="main-chat">
-        <header className="chat-header">
-          <span>diagnose → propose → verify</span>
-          <span>every change needs your approval</span>
-        </header>
-
         {!hasStarted && (
           <div className="hero">
             <h2 className="hero-greeting">How can I help?</h2>
