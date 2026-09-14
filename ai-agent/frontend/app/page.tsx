@@ -48,6 +48,7 @@ export default function Home() {
   const [selectedIssues, setSelectedIssues] = useState<Set<number>>(new Set());
   const [etaText, setEtaText] = useState("");
   const [elapsed, setElapsed] = useState(0);
+  const [theme, setTheme] = useState<"light" | "dark">("dark");
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // Lets the Cancel button abort the in-flight request and hand the UI back to the user.
@@ -97,6 +98,23 @@ export default function Home() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, phase]);
+
+  // Restore the saved theme, falling back to the OS preference on first visit.
+  useEffect(() => {
+    const saved = localStorage.getItem("kubecheck-theme");
+    if (saved === "light" || saved === "dark") {
+      setTheme(saved);
+    } else {
+      setTheme(window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    }
+  }, []);
+
+  // Everything is driven off tokens scoped to [data-theme], so setting this one
+  // attribute restyles the whole interface.
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("kubecheck-theme", theme);
+  }, [theme]);
 
   useEffect(() => {
     const timeout = setTimeout(() => fetchUsage(), 0);
@@ -364,72 +382,107 @@ export default function Home() {
     });
   };
 
+  // Before the first message the composer sits centred under a greeting; once the conversation
+  // starts it docks to the bottom. Same form either way - only its container changes.
+  const hasStarted = messages.length > 0 || phase === "busy";
+
+  const composer = (
+    <div className="composer">
+      <form onSubmit={handleSend} className="chat-input-form">
+        <textarea
+          value={input}
+          onChange={(e) => {
+            setInput(e.target.value);
+            // Grow to fit the typed lines, capped by max-height in CSS.
+            e.target.style.height = "auto";
+            e.target.style.height = `${Math.min(e.target.scrollHeight, 180)}px`;
+          }}
+          onKeyDown={(e) => {
+            // Enter sends, Shift+Enter inserts a newline - so multi-line input (a YAML
+            // snippet, a multi-step request) can be typed without submitting halfway through.
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              handleSend(e);
+            }
+          }}
+          rows={1}
+          placeholder={
+            phase === "busy"
+              ? "Working… cancel above to type a new request"
+              : hasStarted
+                ? "Ask something else, or describe another problem…"
+                : "Describe the problem, or ask about the cluster…"
+          }
+          className="chat-input"
+          // Only locked while a request is actually in flight. A pending approval no longer
+          // blocks you from asking something else - sending a new query drops that proposal.
+          disabled={phase === "busy"}
+        />
+        <button type="submit" disabled={phase === "busy" || !input.trim()} className="chat-send-btn">
+          Send
+        </button>
+      </form>
+    </div>
+  );
+
   return (
     <div className="app-container">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-logo">K</div>
-          <div>
-            <h1 className="brand-name">KubeMedic</h1>
-            <p style={{ fontSize: "11px", color: "var(--text-muted)", fontWeight: 600, textTransform: "uppercase" }}>
-              K8s Diagnosis & Remediation
-            </p>
-          </div>
+          <h1 className="brand-name">KubeCheck</h1>
         </div>
 
-        <div style={{ marginTop: "auto", borderTop: "1px solid var(--panel-border)", paddingTop: "16px" }}>
-          <div className="info-row">Token Usage (session)</div>
+        <div className="usage-block">
+          <div className="side-heading">This session</div>
           {usage ? (
             <>
               {Object.entries(usage.roles).map(([role, r]) => (
                 <div key={role} className="usage-line">
-                  <span style={{ textTransform: "capitalize" }}>{role}</span>
-                  <span>
-                    {r.input_tokens + r.output_tokens} tok / {r.calls} calls
-                  </span>
+                  <span>{role}</span>
+                  <span>{(r.input_tokens + r.output_tokens).toLocaleString()} tok</span>
                 </div>
               ))}
-              <div className="usage-line" style={{ fontWeight: 600, color: "var(--text-primary)" }}>
-                <span>Estimated cost</span>
+              <div className="usage-line usage-total">
+                <span>cost</span>
                 <span>{usage.total_cost !== null ? `$${usage.total_cost.toFixed(4)}` : "n/a"}</span>
               </div>
             </>
           ) : (
-            <div className="info-value">Loading...</div>
+            <div className="usage-line">
+              <span>loading</span>
+            </div>
           )}
         </div>
+
+        <button
+          className="theme-toggle"
+          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+          aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+        >
+          {theme === "dark" ? "Light theme" : "Dark theme"}
+        </button>
       </aside>
 
       <main className="main-chat">
         <header className="chat-header">
-          <span
-            style={{
-              fontSize: "12px",
-              padding: "4px 8px",
-              borderRadius: "8px",
-              background: "rgba(255,255,255,0.05)",
-              color: "var(--text-secondary)",
-              border: "1px solid var(--panel-border)",
-            }}
-          >
-            Reason - Act - Verify
-          </span>
+          <span>diagnose → propose → verify</span>
+          <span>every change needs your approval</span>
         </header>
 
+        {!hasStarted && (
+          <div className="hero">
+            <h2 className="hero-greeting">How can I help?</h2>
+            {composer}
+          </div>
+        )}
+
+        {hasStarted && (
         <div className="chat-messages">
-          {messages.length === 0 ? (
-            <div className="empty-state">
-              <div className="empty-icon">⎈</div>
-              <h3 style={{ fontSize: "18px", color: "var(--text-primary)" }}>Describe a cluster issue</h3>
-              <p style={{ fontSize: "14px", color: "var(--text-secondary)" }}>
-                e.g. &ldquo;my pod api-server-abc123 is crash looping, can you fix it?&rdquo;
-              </p>
-            </div>
-          ) : (
+          {
             messages.map((msg, idx) => (
               <div key={idx} className={`message-row ${msg.role} animate-message`}>
                 <div className="message-bubble">
-                  <div className="message-sender">{msg.role === "user" ? "You" : "KubeMedic"}</div>
+                  <div className="message-sender">{msg.role === "user" ? "You" : "KubeCheck"}</div>
 
                   {msg.goalBadge && (
                     <div className={`goal-badge ${msg.goalBadge}`}>
@@ -442,13 +495,14 @@ export default function Home() {
                   </div>
 
                   {phase === "awaiting_decision" && idx === messages.length - 1 && (
-                    <>
+                    <div className="decision-panel">
+                      <div className="decision-prompt">Nothing has changed on the cluster yet.</div>
                       <div className="decision-actions">
                         <button className="decision-btn approve" onClick={() => handleDecision(true)}>
-                          Approve & Apply
+                          Apply this fix
                         </button>
                         <button className="decision-btn reject" onClick={() => handleDecision(false)}>
-                          Reject
+                          Discard
                         </button>
                       </div>
                       <form onSubmit={handleGuidance} className="guidance-form">
@@ -456,24 +510,25 @@ export default function Home() {
                           type="text"
                           value={guidanceInput}
                           onChange={(ev) => setGuidanceInput(ev.target.value)}
-                          placeholder="Or give a custom instruction instead (e.g. &quot;use envFrom, not an annotation&quot;)..."
+                          placeholder="or tell it to do something different…"
                           className="guidance-input"
                         />
                         <button type="submit" disabled={!guidanceInput.trim()} className="guidance-send-btn">
                           Send
                         </button>
                       </form>
-                    </>
+                    </div>
                   )}
 
                   {phase === "awaiting_retry" && idx === messages.length - 1 && (
-                    <>
+                    <div className="decision-panel">
+                      <div className="decision-prompt">That did not resolve it.</div>
                       <div className="decision-actions">
                         <button className="decision-btn approve" onClick={() => handleRetry(true)}>
-                          Try New Fix
+                          Try a different fix
                         </button>
                         <button className="decision-btn reject" onClick={() => handleRetry(false)}>
-                          Stop
+                          Stop here
                         </button>
                       </div>
                       <form onSubmit={handleGuidance} className="guidance-form">
@@ -481,18 +536,19 @@ export default function Home() {
                           type="text"
                           value={guidanceInput}
                           onChange={(ev) => setGuidanceInput(ev.target.value)}
-                          placeholder="Or give a custom instruction for the next attempt..."
+                          placeholder="or tell it what to try instead…"
                           className="guidance-input"
                         />
                         <button type="submit" disabled={!guidanceInput.trim()} className="guidance-send-btn">
                           Send
                         </button>
                       </form>
-                    </>
+                    </div>
                   )}
 
                   {phase === "awaiting_issue_selection" && idx === messages.length - 1 && (
                     <div className="issue-select-panel">
+                      <div className="decision-prompt">Which should it fix?</div>
                       {issues.map((issue, i) => (
                         <label key={i} className="issue-checkbox-row">
                           <input
@@ -510,14 +566,14 @@ export default function Home() {
                           onClick={handleIssueSelection}
                         >
                           {selectedIssues.size === issues.length
-                            ? "Fix All Selected"
-                            : `Fix ${selectedIssues.size} Selected`}
+                            ? `Fix all ${issues.length}`
+                            : `Fix ${selectedIssues.size} of ${issues.length}`}
                         </button>
                         <button
                           className="decision-btn neutral"
                           onClick={() => setSelectedIssues(new Set(issues.map((_, i) => i)))}
                         >
-                          Select All
+                          Select all
                         </button>
                       </div>
                     </div>
@@ -525,15 +581,15 @@ export default function Home() {
                 </div>
               </div>
             ))
-          )}
+          }
 
           {phase === "busy" && (
             <div className="message-row ai animate-message">
-              <div className="message-bubble" style={{ color: "var(--text-muted)" }}>
-                <div className="message-sender">KubeMedic</div>
-                <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+              <div className="message-bubble">
+                <div className="message-sender">KubeCheck</div>
+                <div className="busy-line">
+                  <div className="status-dot running" />
                   <span>{busyText}</span>
-                  <div className="status-dot running" style={{ width: "6px", height: "6px" }} />
                 </div>
                 <div className="busy-meta">
                   <span>
@@ -549,41 +605,9 @@ export default function Home() {
 
           <div ref={messagesEndRef} />
         </div>
+        )}
 
-        <div className="chat-input-container">
-          <form onSubmit={handleSend} className="chat-input-form">
-            <textarea
-              value={input}
-              onChange={(e) => {
-                setInput(e.target.value);
-                // Grow to fit the typed lines, capped by max-height in CSS.
-                e.target.style.height = "auto";
-                e.target.style.height = `${Math.min(e.target.scrollHeight, 180)}px`;
-              }}
-              onKeyDown={(e) => {
-                // Enter sends, Shift+Enter inserts a newline - so multi-line input (a YAML
-                // snippet, a multi-step request) can be typed without submitting halfway through.
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  handleSend(e);
-                }
-              }}
-              rows={1}
-              placeholder={
-                phase === "busy"
-                  ? "Working... cancel above to type a new request"
-                  : "Describe the Kubernetes issue or ask a question...  (Shift+Enter for a new line)"
-              }
-              className="chat-input"
-              // Only locked while a request is actually in flight. A pending approval no longer
-              // blocks you from asking something else - sending a new query drops that proposal.
-              disabled={phase === "busy"}
-            />
-            <button type="submit" disabled={phase === "busy" || !input.trim()} className="chat-send-btn">
-              &#10148;
-            </button>
-          </form>
-        </div>
+        {hasStarted && <div className="chat-input-container">{composer}</div>}
       </main>
     </div>
   );

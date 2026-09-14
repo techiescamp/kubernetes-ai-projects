@@ -1,172 +1,237 @@
-# Deploying `ai-agent` to Kubernetes
+# Deploying `ai-agent` (KubeMedic) to Kubernetes
 
-This folder contains everything needed to run the backend (LangGraph agent + FastAPI) and
-frontend (Next.js chat UI) as a Kubernetes workload, with durable memory (Postgres), RBAC scoped
-to what the agent's tools actually do, network policy, health probes, and resource limits.
+Runs the backend (LangGraph agent + FastAPI) and frontend (Next.js chat UI) as a Kubernetes
+workload, with durable state in Postgres, RBAC scoped to what the agent's tools actually do,
+NetworkPolicies, health probes and resource limits.
 
-## Prerequisites
+---
 
-| Needed for | Requirement | Status on this machine (as of last check) |
-|---|---|---|
-| Everything | `kubectl` pointed at your target cluster | Done - `do-ams3-crunchmedia-k8s-cluster` (DigitalOcean) is the current context |
-| Phase 1 (infra-only) | Cluster-admin `kubectl` access (to create a ClusterRole/ClusterRoleBinding) | Assumed yes - same kubeconfig as above |
-| Phase 1 (infra-only) | A Postgres password for the checkpoint store | Not generated yet - any strong random string, doesn't need to be memorable |
-| Phase 2 (images) | Docker or Podman, to build `Dockerfile`/`frontend/Dockerfile` | **Not installed** - neither `docker` nor `podman` found |
-| Phase 2 (images) | A container registry reachable from the cluster (e.g. DigitalOcean Container Registry, Docker Hub, GHCR) | **Not set up** - no DOCR registry exists on this DO account yet (`doctl registry get` returns 404) |
-| Phase 3 (real Bedrock calls) | AWS IAM access key + secret with `bedrock:InvokeModel` on the two model IDs in `.env.example`, since DigitalOcean has no IRSA equivalent | Not provided - needed only once you want the agent to actually call Bedrock, not for infra validation |
+## 1. Prerequisites
 
-**Why phases:** you don't need Docker, a registry, or AWS credentials to validate that the RBAC,
-Postgres, NetworkPolicy, and ConfigMap manifests are correct and reconcile cleanly on the real
-cluster - that's Phase 1 below. Docker/registry are only needed once you want the backend/frontend
-pods themselves running (Phase 2). AWS credentials are only needed once you want the agent to make
-real Bedrock calls (Phase 3).
+| Needed for | Requirement |
+|---|---|
+| Everything | `kubectl` pointed at your target cluster |
+| Everything | Cluster-admin rights (the install creates a ClusterRole/ClusterRoleBinding) |
+| Everything | A default StorageClass (Postgres requests a 5Gi PVC) |
+| Building images | Docker (or Podman) |
+| Building images | A registry the cluster can pull from — Docker Hub, GHCR, DOCR, ECR… |
+| Running the agent | AWS credentials with `bedrock:InvokeModel` on the model IDs in `03-configmap.yaml` |
+| Running the agent | A strong Postgres password |
 
-## Phase 1: infra-only validation (no Docker, no AWS credentials needed)
+**On AWS credentials:** on EKS, prefer IRSA — annotate the ServiceAccount in
+`01-serviceaccount.yaml` with `eks.amazonaws.com/role-arn` and leave the AWS keys out entirely;
+boto3 picks the role up automatically. On any other cluster (DigitalOcean, GKE, kind…) there is no
+IRSA equivalent, so static keys go in `04-secret.yaml`.
 
-```sh
-kubectl apply -f k8s/00-namespace.yaml
-kubectl apply -f k8s/01-serviceaccount.yaml
-kubectl apply -f k8s/02-rbac.yaml
-kubectl apply -f k8s/03-configmap.yaml
-# k8s/secret.yaml here only needs POSTGRES_PASSWORD/DATABASE_PASSWORD filled in - AWS keys can be
-# left as empty strings or omitted entirely (they're marked optional: true in the Deployment).
-kubectl apply -f k8s/secret.yaml
-kubectl apply -f k8s/05-postgres.yaml
-kubectl apply -f k8s/11-networkpolicy.yaml
-kubectl apply -f k8s/12-pdb.yaml
-```
-
-Verify: `kubectl -n ai-agent get pods` should show the `ai-agent-postgres-0` pod reach `Running`/
-`1/1`; `kubectl get clusterrole,clusterrolebinding ai-agent` should show the RBAC objects created.
-The NetworkPolicies and PDBs will exist but have no effect yet (they select pods from the backend/
-frontend Deployments, which don't exist until Phase 2) - that's expected, not an error.
-
-## Phase 2: build and push the images
-
-Run these from the `ai-agent/` root - both the backend and frontend now live in their own
-subfolders with their own `Dockerfile`, mirroring each other:
+Check your cluster is ready:
 
 ```sh
-docker build -t <your-registry>/ai-agent-backend:latest backend/
-docker push <your-registry>/ai-agent-backend:latest
-
-docker build -t <your-registry>/ai-agent-frontend:latest frontend/
-docker push <your-registry>/ai-agent-frontend:latest
+kubectl cluster-info
+kubectl get storageclass          # at least one marked (default)
 ```
 
-The frontend no longer needs a build-time backend URL - it proxies the browser's relative `/api/*`
-calls to the backend server-side (see `frontend/next.config.ts`'s `rewrites()`), configured via the
-plain runtime `BACKEND_URL` env var in `08-frontend-deployment.yaml` (sourced from the ConfigMap).
-This is what makes the frontend work from a real browser regardless of how it's reached
-(`kubectl port-forward`, a LoadBalancer IP, an Ingress hostname) without ever needing a rebuild.
+---
 
-Then update the `image:` field in `06-backend-deployment.yaml` and `08-frontend-deployment.yaml`
-to point at your pushed images.
+## 2. Dockerization
 
-**Using Docker Hub specifically:** `<your-registry>` is `docker.io/<your-dockerhub-username>` (or
-just `<your-dockerhub-username>/...` - Docker's CLI defaults to Docker Hub when no registry host
-is given). A newly created Docker Hub repo is **private by default** unless you explicitly set it
-public, and a private image can't be pulled by the cluster without credentials - if yours is
-private, uncomment the `imagePullSecrets` block in both `06-backend-deployment.yaml` and
-`08-frontend-deployment.yaml`, then create the referenced secret once:
+Backend and frontend each have their own `Dockerfile`. Build from the `ai-agent/` root:
+
+```sh
+export REGISTRY=docker.io/<your-username>
+export TAG=v1.4.4
+
+docker build -t $REGISTRY/ai-agent-backend:$TAG  backend/
+docker build -t $REGISTRY/ai-agent-frontend:$TAG frontend/
+
+docker push $REGISTRY/ai-agent-backend:$TAG
+docker push $REGISTRY/ai-agent-frontend:$TAG
+```
+
+Then point the manifests at your images by editing **`kustomization.yaml`** (not the Deployment
+files — kustomize overrides them at build time):
+
+```yaml
+images:
+  - name: docker.io/devopscube/ai-agent-backend
+    newName: docker.io/<your-username>/ai-agent-backend   # only if your registry differs
+    newTag: v1.4.4
+  - name: docker.io/devopscube/ai-agent-frontend
+    newName: docker.io/<your-username>/ai-agent-frontend
+    newTag: v1.4.4
+```
+
+**No build-time config is needed for the frontend.** The browser only ever calls relative `/api/*`
+paths, which a Next.js Route Handler (`frontend/app/api/[...path]/route.ts`) proxies server-side to
+the backend, reading `BACKEND_URL` fresh per request. That's why the same image works behind
+`port-forward`, a LoadBalancer or an Ingress without rebuilding.
+
+### Private registry
+
+Docker Hub repos are **private by default**, and the manifests already reference an
+`ai-agent-registry` pull secret. Create it once:
 
 ```sh
 kubectl -n ai-agent create secret docker-registry ai-agent-registry \
   --docker-server=https://index.docker.io/v1/ \
-  --docker-username=<your-dockerhub-username> \
-  --docker-password=<a Docker Hub access token, not your account password> \
-  --docker-email=<your-email>
+  --docker-username=<username> \
+  --docker-password=<access token, not your password> \
+  --docker-email=<email>
 ```
 
-(Generate the access token from Docker Hub under Account Settings -> Security -> New Access
-Token, scoped to Read-only if you only need pulls.) If the repo is public, skip this entirely and
-leave `imagePullSecrets` commented out.
+If your images are public, delete the `imagePullSecrets` block from
+`06-backend-deployment.yaml` and `08-frontend-deployment.yaml`.
 
-## Phase 3: real AWS credentials + full deploy
+---
 
-Fill in the rest of `k8s/secret.yaml` (copied from `04-secret.example.yaml`) with real values:
+## 3. Deploy with Kustomize
 
-- **AWS credentials for Bedrock** - two options:
-  - **EKS (recommended, not applicable to DigitalOcean):** leave `AWS_ACCESS_KEY_ID`/
-    `AWS_SECRET_ACCESS_KEY` out of `secret.yaml` entirely, and instead uncomment the
-    `eks.amazonaws.com/role-arn` annotation in `01-serviceaccount.yaml`, pointing at an IAM role
-    with `bedrock:InvokeModel` permissions (IRSA). No static keys ever touch the cluster;
-    `bedrock_clients.py` picks this up automatically via boto3's default credential chain.
-  - **Any other cluster (including DigitalOcean, which has no IRSA equivalent):** fill in real
-    `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` values - they're mounted as env vars in
-    `06-backend-deployment.yaml` (marked `optional: true` so the Deployment still works if you go
-    the IRSA route and omit them).
+First fill in `04-secret.yaml` — `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`DATABASE_PASSWORD`, and `POSTGRES_PASSWORD` (the two passwords **must match**; Postgres sets its
+password only on first `initdb`, so a mismatch later means the backend can't authenticate).
 
-Then apply the remaining manifests:
+> `04-secret.yaml` holds real credentials. Keep it out of version control.
+
+Preview, then apply:
 
 ```sh
-kubectl apply -f k8s/06-backend-deployment.yaml
-kubectl apply -f k8s/07-backend-service.yaml
-kubectl apply -f k8s/08-frontend-deployment.yaml
-kubectl apply -f k8s/09-frontend-service.yaml
-# Optional:
-kubectl apply -f k8s/10-ingress.yaml         # only if you want external access via Ingress
-kubectl apply -f k8s/13-servicemonitor.yaml  # only if the Prometheus Operator is installed
+cd ai-agent
+
+kubectl kustomize k8s/          # render everything, change nothing
+kubectl apply -k k8s/           # create/update all objects
+kubectl diff -k k8s/            # what would change vs the live cluster
 ```
 
-Or simply `kubectl apply -f k8s/` once images/credentials are ready (excluding
-`04-secret.example.yaml`, which is a template, not a real manifest) - the numeric prefixes keep
-`kubectl apply` roughly dependency-ordered, though Kubernetes will happily retry objects that
-reference something not-yet-created.
+`kustomization.yaml` applies two transforms for you:
+- **`namespace: ai-agent`** on every namespaced object (and on the ClusterRoleBinding's subject)
+- **`images:`** rewrites the backend/frontend tags — one edit instead of two Deployment files
+
+Optional extras are commented out in `kustomization.yaml`; uncomment if your cluster has the
+prerequisites:
+
+```yaml
+#  - 10-ingress.yaml        # needs an ingress controller
+#  - 12-servicemonitor.yaml # needs the Prometheus Operator
+```
 
 ### Verify
 
 ```sh
-kubectl -n ai-agent get pods            # both Deployments + the postgres StatefulSet Ready
+kubectl -n ai-agent get pods                       # 2 backend, 2 frontend, 1 postgres - all Ready
 kubectl -n ai-agent logs deploy/ai-agent-backend -f
-kubectl -n ai-agent port-forward svc/ai-agent-frontend 3000:3000   # open http://localhost:3000
+kubectl -n ai-agent get clusterrole,clusterrolebinding ai-agent
 ```
 
-## RBAC rationale and boundaries (`02-rbac.yaml`)
+Postgres must be `Running` before the backend becomes Ready — the readiness probe checks both the
+Kubernetes API and the Bedrock client.
 
-The `ClusterRole` is intentionally broad within a **documented boundary**, not a blanket
-`resources: ["*"]`/`verbs: ["*"]` grant:
+### Tear down
 
-- Read access (`get/list/watch`) is granted cluster-wide across the resource kinds the diagnostic
-  tools in `k8s_tools.py` actually query (pods, nodes, deployments, services, ingresses, jobs,
-  PVCs, HPAs, events, etc.) - this is what lets the agent answer "what's wrong with the cluster"
-  for essentially any resource type, not just pods.
-- Write access is scoped to exactly what the remediation tools do (patch pod/deployment images,
-  scale, restart, create/delete pods, create namespaces).
-- `apply_kubernetes_yaml` and `delete_resource` can create/update/delete a **curated set of common
-  workload kinds only** (Pod, Deployment, Service, ConfigMap, PVC, Ingress, Job, CronJob,
-  StatefulSet, DaemonSet) - matching `k8s_tools.py`'s `_ALLOWED_KINDS`.
-- **Two things are deliberately never granted, regardless of what gets approved:**
-  1. `rbac.authorization.k8s.io` (Roles/ClusterRoles/RoleBindings/ClusterRoleBindings) - so the
-     agent can never grant itself (or anything else) more permissions than it starts with.
-  2. Namespace **deletion** and Secret **values** - the agent can list Secret names/keys for
-     troubleshooting wiring issues, but never reads or writes secret data, and can create
-     namespaces but never delete one (a namespace delete cascades to everything inside it).
+```sh
+kubectl delete -k k8s/
+```
 
-The primary safety control is still the human-approval gate in `agents.py`
-(`interrupt_before=["apply_remediation", "propose_retry"]`) - no write action, including
-`apply_kubernetes_yaml`, ever runs without a person approving it via `POST /api/decision` first.
-RBAC is the backstop that bounds what an *approved* action is even capable of doing, in the spirit
-of the least-privilege authorization principle from
-[kube-agentic-networking](https://kube-agentic-networking.sigs.k8s.io/) (whose actual CRDs aren't
-stable/installable yet, so this uses core `ClusterRole`/`NetworkPolicy` instead).
+---
 
-If you want tighter scoping later, the natural next step is splitting this into two
-ServiceAccounts/ClusterRoles (one read-only for the diagnostics/verification model, one with
-write access for the remediation model) - not done here since `agents.py` currently runs both
-tool sets from the same process/pod identity.
+## 4. Port forwarding
 
-## Using a managed database instead of the in-cluster Postgres
+Both Services are `ClusterIP`, so nothing is exposed publicly by default.
 
-Delete `05-postgres.yaml` and change `DATABASE_HOST`/`DATABASE_PORT`/`DATABASE_NAME`/
-`DATABASE_USER` in `03-configmap.yaml` (and `DATABASE_PASSWORD` in `secret.yaml`) to point at your
-managed instance (RDS, Cloud SQL, etc.). No code change is needed - `checkpointer.py` just reads
-`DATABASE_URL`, which `06-backend-deployment.yaml` assembles from those same keys.
+**Frontend (the chat UI — what you normally want):**
+
+```sh
+kubectl -n ai-agent port-forward svc/ai-agent-frontend 3000:3000
+```
+
+Open <http://localhost:3000>.
+
+**Backend (the API directly):**
+
+```sh
+kubectl -n ai-agent port-forward svc/ai-agent-backend 8000:8000
+```
+
+```sh
+curl -sS http://localhost:8000/healthz
+
+curl -sS -X POST http://localhost:8000/api/query \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"list all pods in kube-system"}'
+```
+
+The mapping is `LOCAL:REMOTE` — the Services listen on **3000** and **8000**, so
+`port-forward ... 8080:8000` is how you'd use a different local port. Keep the command running in
+its own terminal; it logs `Handling connection for …` on each request, which is the quickest way to
+tell whether your client is reaching it at all.
+
+Other endpoints: `/readyz`, `/metrics`, `/api/usage`, and the flow endpoints `/api/select-issues`,
+`/api/decision`, `/api/guidance`, `/api/retry`.
+
+### Exposing it for real
+
+```sh
+kubectl -n ai-agent patch svc ai-agent-frontend -p '{"spec":{"type":"LoadBalancer"}}'
+```
+
+**Expose the frontend only — never the backend.** The API has no authentication, so anyone who can
+reach it can make the agent change your cluster. If you serve the frontend on a real hostname, add
+that origin to `ALLOWED_ORIGINS` in `03-configmap.yaml`.
+
+---
+
+## Manifest reference
+
+| File | Purpose |
+|---|---|
+| `00-namespace.yaml` | `ai-agent` namespace |
+| `01-serviceaccount.yaml` | Agent identity (IRSA annotation goes here on EKS) |
+| `02-rbac.yaml` | ClusterRole + binding — see boundaries below |
+| `03-configmap.yaml` | Region, model IDs, `REQUIRE_APPROVAL`, DB host, `BACKEND_URL`, CORS |
+| `04-secret.yaml` | AWS keys, DB passwords, optional price-per-1k values |
+| `05-postgres.yaml` | Postgres StatefulSet + 5Gi PVC (checkpoints & history) |
+| `06/07` | Backend Deployment + Service |
+| `08/09` | Frontend Deployment + Service |
+| `10-ingress.yaml` | Optional external access |
+| `11-networkpolicy.yaml` | frontend → backend → postgres only |
+| `12-servicemonitor.yaml` | Optional Prometheus scrape |
+
+---
+
+## Security boundaries (`02-rbac.yaml` + code guards)
+
+The agent has **broad write access** across API groups, deliberately — it is meant to fix real
+problems. What bounds it:
+
+**Enforced by RBAC (hard guarantees):**
+- **Secrets are unreadable.** The core group is enumerated with `secrets` left out, so no `get`/
+  `list` verb exists. The agent can *create/replace* a Secret, but never read one back.
+
+**Enforced in code** (`k8s_tools.py`) — Kubernetes RBAC has no "deny" rule, so "everything except
+X" cannot be expressed there:
+- Cannot modify **its own RBAC** — its ServiceAccount, ClusterRole/Binding, anything in its own
+  namespace, or *any* binding whose subject is the agent (blocking by name alone is bypassable by
+  creating a new binding).
+- **System namespaces** (`kube-system`, `kube-public`, `kube-node-lease`, its own) are left alone
+  while healthy; writes are allowed once a workload there is genuinely broken.
+- **Destructive actions refused:** deleting a standalone Pod (nothing would recreate it), deleting
+  a Bound PersistentVolume, deleting a Node, and restarts that cannot possibly help (e.g.
+  `ImagePullBackOff` — the replacement pod fails identically).
+
+**The real control is the human-approval gate** in `agents.py`
+(`interrupt_before=["select_issues", "apply_remediation", "propose_retry"]`). No write runs without
+someone approving it via `POST /api/decision`. Setting `REQUIRE_APPROVAL: "false"` in the ConfigMap
+removes that gate entirely — with broad write access that means an LLM changing your cluster
+unsupervised. Leave it `"true"` unless you have a specific reason.
+
+---
+
+## Using a managed database
+
+Remove `05-postgres.yaml` from `kustomization.yaml` and update `DATABASE_HOST`/`DATABASE_PORT`/
+`DATABASE_NAME`/`DATABASE_USER` in `03-configmap.yaml` plus `DATABASE_PASSWORD` in
+`04-secret.yaml`. No code change needed — `checkpointer.py` just reads the assembled `DATABASE_URL`.
 
 ## Resource sizing
 
-Backend: `requests: {cpu: 250m, memory: 256Mi}`, `limits: {cpu: 1, memory: 512Mi}` - sized for a
-Python process making Bedrock/K8s API calls, not local model inference. Frontend: `requests:
-{cpu: 100m, memory: 128Mi}`, `limits: {cpu: 500m, memory: 256Mi}`. Postgres: `requests: {cpu:
-100m, memory: 256Mi}`, `limits: {cpu: 500m, memory: 512Mi}`. Adjust based on real usage once
-deployed - these are starting points, not measured values.
+Backend `250m/256Mi` → `1/512Mi`; frontend `100m/128Mi` → `500m/256Mi`; Postgres `100m/256Mi` →
+`500m/512Mi`. Sized for a Python process making Bedrock and Kubernetes API calls, not local
+inference. Starting points, not measured values — adjust once you see real usage.

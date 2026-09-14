@@ -1,20 +1,9 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
-
 export const metadata: Metadata = {
-  title: "KubeMedic - Kubernetes Diagnosis & Remediation",
-  description: "Reason-Act-Verify AIOps agent for Kubernetes, powered by AWS Bedrock (Amazon Nova Pro)",
+  title: "KubeCheck - Kubernetes triage",
+  description: "Diagnoses Kubernetes problems, proposes a fix, and applies it once you approve.",
 };
 
 export default function RootLayout({
@@ -23,11 +12,17 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html
-      lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-    >
-      <body className="min-h-full flex flex-col">{children}</body>
+    // data-theme is set before paint by the script below, then kept in sync by the app, so the
+    // page never flashes the wrong theme on load.
+    <html lang="en" data-theme="dark" suppressHydrationWarning>
+      <head>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{var t=localStorage.getItem('kubecheck-theme');if(t!=='light'&&t!=='dark'){t=window.matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';}document.documentElement.setAttribute('data-theme',t);}catch(e){}})();`,
+          }}
+        />
+      </head>
+      <body>{children}</body>
     </html>
   );
 }
