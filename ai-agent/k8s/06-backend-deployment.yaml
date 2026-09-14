@@ -5,7 +5,7 @@ metadata:
   namespace: ai-agent
   labels: {app: ai-agent-backend}
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels: {app: ai-agent-backend}
   template:
