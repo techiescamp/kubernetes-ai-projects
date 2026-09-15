@@ -8,18 +8,51 @@ resources:
   - 01-serviceaccount.yaml
   - 02-rbac.yaml
   - 03-configmap.yaml
-  - 04-secret.yaml
-  - 05-postgres.yaml
-  - 06-backend-deployment.yaml
-  - 07-backend-service.yaml
-  - 08-frontend-deployment.yaml
-  - 09-frontend-service.yaml
-  - 11-networkpolicy.yaml
-#  - 10-ingress.yaml
-#  - 12-servicemonitor.yaml
+  - 04-postgres.yaml
+  - 05-backend-deployment.yaml
+  - 06-backend-service.yaml
+  - 07-frontend-deployment.yaml
+  - 08-frontend-service.yaml
+  - 10-networkpolicy.yaml
+#  - 09-ingress.yaml
+#  - 11-servicemonitor.yaml
 
 images:
   - name: docker.io/devopscube/ai-agent-backend
     newTag: v1.4.4
   - name: docker.io/devopscube/ai-agent-frontend
     newTag: v1.7.1
+
+replicas:
+  - name: ai-agent-backend
+    count: 1
+  - name: ai-agent-frontend
+    count: 1
+
+configMapGenerator:
+  - name: ai-agent-config
+    namespace: ai-agent
+    behavior: merge
+    literals:
+      - AWS_REGION=us-west-2
+      - DIAGNOSTICS_MODEL_ID=us.amazon.nova-pro-v1:0
+      - REMEDIATION_MODEL_ID=us.amazon.nova-pro-v1:0
+      - LOG_LEVEL=INFO
+      - MAX_REMEDIATION_ATTEMPTS=3
+      - REQUIRE_APPROVAL=true
+      - DIAGNOSTICS_MODEL_PRICE_INPUT_PER_1K=0.0008
+      - DIAGNOSTICS_MODEL_PRICE_OUTPUT_PER_1K=0.0032
+      - REMEDIATION_MODEL_PRICE_INPUT_PER_1K=0.0008
+      - REMEDIATION_MODEL_PRICE_OUTPUT_PER_1K=0.0032
+
+secretGenerator:
+  - name: ai-agent-secrets
+    namespace: ai-agent
+    literals:
+      - DATABASE_PASSWORD=changeme
+#      - AWS_ACCESS_KEY_ID=your-access-key-id
+#      - AWS_SECRET_ACCESS_KEY=your-secret-access-key
+  - name: ai-agent-postgres-secrets
+    namespace: ai-agent
+    literals:
+      - POSTGRES_PASSWORD=changeme

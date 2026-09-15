@@ -1,237 +1,180 @@
-# Deploying `ai-agent` (KubeMedic) to Kubernetes
+# Deploying KubeCheck
 
-Runs the backend (LangGraph agent + FastAPI) and frontend (Next.js chat UI) as a Kubernetes
-workload, with durable state in Postgres, RBAC scoped to what the agent's tools actually do,
-NetworkPolicies, health probes and resource limits.
+Backend (LangGraph + FastAPI), frontend (Next.js chat UI), and Postgres for durable state.
+
+For a step-by-step EKS install, see [`../step.md`](../step.md).
 
 ---
 
-## 1. Prerequisites
+## Prerequisites
 
-| Needed for | Requirement |
-|---|---|
-| Everything | `kubectl` pointed at your target cluster |
-| Everything | Cluster-admin rights (the install creates a ClusterRole/ClusterRoleBinding) |
-| Everything | A default StorageClass (Postgres requests a 5Gi PVC) |
-| Building images | Docker (or Podman) |
-| Building images | A registry the cluster can pull from — Docker Hub, GHCR, DOCR, ECR… |
-| Running the agent | AWS credentials with `bedrock:InvokeModel` on the model IDs in `03-configmap.yaml` |
-| Running the agent | A strong Postgres password |
-
-**On AWS credentials:** on EKS, prefer IRSA — annotate the ServiceAccount in
-`01-serviceaccount.yaml` with `eks.amazonaws.com/role-arn` and leave the AWS keys out entirely;
-boto3 picks the role up automatically. On any other cluster (DigitalOcean, GKE, kind…) there is no
-IRSA equivalent, so static keys go in `04-secret.yaml`.
-
-Check your cluster is ready:
+- `kubectl` pointed at your cluster, with cluster-admin rights
+- A default StorageClass (Postgres requests a 5Gi PVC)
+- AWS credentials with `bedrock:InvokeModel`
+- Docker and a registry, if you are building your own images
 
 ```sh
 kubectl cluster-info
 kubectl get storageclass          # at least one marked (default)
 ```
 
+**AWS credentials.** On EKS run `./setup-pod-identity.sh` — it creates the IAM role and maps it to
+the ServiceAccount, and no keys go in any file. Anywhere else, uncomment the two `AWS_*` literals in
+the `secretGenerator` block of `kustomization.yaml`.
+
+On EKS those lines must stay commented. Environment variables beat the Pod Identity endpoint in
+boto3's credential chain, so any value there overrides the role and every Bedrock call fails with
+`InvalidClientTokenId`.
+
 ---
 
-## 2. Dockerization
+## Build the images
 
-Backend and frontend each have their own `Dockerfile`. Build from the `ai-agent/` root:
+Skip this if you are using the prebuilt `devopscube/*` images.
 
 ```sh
 export REGISTRY=docker.io/<your-username>
-export TAG=v1.4.4
+export TAG=v1.0.0
 
 docker build -t $REGISTRY/ai-agent-backend:$TAG  backend/
 docker build -t $REGISTRY/ai-agent-frontend:$TAG frontend/
-
 docker push $REGISTRY/ai-agent-backend:$TAG
 docker push $REGISTRY/ai-agent-frontend:$TAG
 ```
 
-Then point the manifests at your images by editing **`kustomization.yaml`** (not the Deployment
-files — kustomize overrides them at build time):
+Point the manifests at them in `kustomization.yaml`, not in the Deployment files:
 
 ```yaml
 images:
   - name: docker.io/devopscube/ai-agent-backend
-    newName: docker.io/<your-username>/ai-agent-backend   # only if your registry differs
-    newTag: v1.4.4
-  - name: docker.io/devopscube/ai-agent-frontend
-    newName: docker.io/<your-username>/ai-agent-frontend
-    newTag: v1.4.4
+    newName: docker.io/<your-username>/ai-agent-backend
+    newTag: v1.0.0
 ```
 
-**No build-time config is needed for the frontend.** The browser only ever calls relative `/api/*`
-paths, which a Next.js Route Handler (`frontend/app/api/[...path]/route.ts`) proxies server-side to
-the backend, reading `BACKEND_URL` fresh per request. That's why the same image works behind
-`port-forward`, a LoadBalancer or an Ingress without rebuilding.
+The frontend needs no build-time config — the browser calls relative `/api/*` paths and a Next.js
+Route Handler proxies them server-side, reading `BACKEND_URL` per request.
 
-### Private registry
-
-Docker Hub repos are **private by default**, and the manifests already reference an
-`ai-agent-registry` pull secret. Create it once:
+**Private registry.** Docker Hub repos are private by default and the Deployments reference an
+`ai-agent-registry` pull secret:
 
 ```sh
 kubectl -n ai-agent create secret docker-registry ai-agent-registry \
   --docker-server=https://index.docker.io/v1/ \
   --docker-username=<username> \
-  --docker-password=<access token, not your password> \
+  --docker-password=<access token> \
   --docker-email=<email>
 ```
 
-If your images are public, delete the `imagePullSecrets` block from
-`06-backend-deployment.yaml` and `08-frontend-deployment.yaml`.
+If your images are public, delete the `imagePullSecrets` block from the two Deployment files.
 
 ---
 
-## 3. Deploy with Kustomize
+## Deploy
 
-First fill in `04-secret.yaml` — `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-`DATABASE_PASSWORD`, and `POSTGRES_PASSWORD` (the two passwords **must match**; Postgres sets its
-password only on first `initdb`, so a mismatch later means the backend can't authenticate).
+Set `DATABASE_PASSWORD` and `POSTGRES_PASSWORD` in `kustomization.yaml`. **They must match** —
+Postgres only reads its password at first `initdb`, so changing it later on an existing volume also
+needs an `ALTER USER`.
 
-> `04-secret.yaml` holds real credentials. Keep it out of version control.
-
-Preview, then apply:
+> Once filled in, `kustomization.yaml` holds real credentials. Keep it out of version control.
 
 ```sh
 cd ai-agent
 
-kubectl kustomize k8s/          # render everything, change nothing
-kubectl apply -k k8s/           # create/update all objects
-kubectl diff -k k8s/            # what would change vs the live cluster
+kubectl kustomize k8s/          # render, change nothing
+kubectl apply -k k8s/           # create/update everything
+kubectl diff -k k8s/            # what would change
+kubectl delete -k k8s/          # tear down
 ```
 
-`kustomization.yaml` applies two transforms for you:
-- **`namespace: ai-agent`** on every namespaced object (and on the ClusterRoleBinding's subject)
-- **`images:`** rewrites the backend/frontend tags — one edit instead of two Deployment files
-
-Optional extras are commented out in `kustomization.yaml`; uncomment if your cluster has the
-prerequisites:
-
-```yaml
-#  - 10-ingress.yaml        # needs an ingress controller
-#  - 12-servicemonitor.yaml # needs the Prometheus Operator
-```
-
-### Verify
+Check it came up:
 
 ```sh
-kubectl -n ai-agent get pods                       # 2 backend, 2 frontend, 1 postgres - all Ready
+kubectl -n ai-agent get pods
 kubectl -n ai-agent logs deploy/ai-agent-backend -f
-kubectl -n ai-agent get clusterrole,clusterrolebinding ai-agent
 ```
 
-Postgres must be `Running` before the backend becomes Ready — the readiness probe checks both the
-Kubernetes API and the Bedrock client.
-
-### Tear down
-
-```sh
-kubectl delete -k k8s/
-```
+The backend restarts once or twice on a fresh install — it checks Postgres at startup and exits if
+it isn't ready yet, then succeeds once Postgres finishes initializing.
 
 ---
 
-## 4. Port forwarding
+## Open the UI
 
-Both Services are `ClusterIP`, so nothing is exposed publicly by default.
-
-**Frontend (the chat UI — what you normally want):**
+Both Services are `ClusterIP`, so nothing is public by default.
 
 ```sh
 kubectl -n ai-agent port-forward svc/ai-agent-frontend 3000:3000
 ```
 
-Open <http://localhost:3000>.
+Then open <http://localhost:3000>.
 
-**Backend (the API directly):**
+For the API directly:
 
 ```sh
 kubectl -n ai-agent port-forward svc/ai-agent-backend 8000:8000
-```
-
-```sh
 curl -sS http://localhost:8000/healthz
-
-curl -sS -X POST http://localhost:8000/api/query \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"list all pods in kube-system"}'
 ```
 
-The mapping is `LOCAL:REMOTE` — the Services listen on **3000** and **8000**, so
-`port-forward ... 8080:8000` is how you'd use a different local port. Keep the command running in
-its own terminal; it logs `Handling connection for …` on each request, which is the quickest way to
-tell whether your client is reaching it at all.
-
-Other endpoints: `/readyz`, `/metrics`, `/api/usage`, and the flow endpoints `/api/select-issues`,
-`/api/decision`, `/api/guidance`, `/api/retry`.
-
-### Exposing it for real
-
-```sh
-kubectl -n ai-agent patch svc ai-agent-frontend -p '{"spec":{"type":"LoadBalancer"}}'
-```
-
-**Expose the frontend only — never the backend.** The API has no authentication, so anyone who can
-reach it can make the agent change your cluster. If you serve the frontend on a real hostname, add
-that origin to `ALLOWED_ORIGINS` in `03-configmap.yaml`.
+**Expose the frontend only, never the backend.** The API has no authentication — anyone who reaches
+it can make the agent change your cluster. If you serve the frontend on a real hostname, add that
+origin to `ALLOWED_ORIGINS` in `03-configmap.yaml`.
 
 ---
 
-## Manifest reference
+## What is configurable where
+
+| Where | What |
+|---|---|
+| `kustomization.yaml` | Region, model IDs, prices, `REQUIRE_APPROVAL`, image tags, replicas, passwords |
+| `03-configmap.yaml` | Database host/port/name/user, `BACKEND_URL`, CORS |
 
 | File | Purpose |
 |---|---|
 | `00-namespace.yaml` | `ai-agent` namespace |
-| `01-serviceaccount.yaml` | Agent identity (IRSA annotation goes here on EKS) |
-| `02-rbac.yaml` | ClusterRole + binding — see boundaries below |
-| `03-configmap.yaml` | Region, model IDs, `REQUIRE_APPROVAL`, DB host, `BACKEND_URL`, CORS |
-| `04-secret.yaml` | AWS keys, DB passwords, optional price-per-1k values |
-| `05-postgres.yaml` | Postgres StatefulSet + 5Gi PVC (checkpoints & history) |
-| `06/07` | Backend Deployment + Service |
-| `08/09` | Frontend Deployment + Service |
-| `10-ingress.yaml` | Optional external access |
-| `11-networkpolicy.yaml` | frontend → backend → postgres only |
-| `12-servicemonitor.yaml` | Optional Prometheus scrape |
+| `01-serviceaccount.yaml` | Agent identity |
+| `02-rbac.yaml` | ClusterRole + binding |
+| `03-configmap.yaml` | Non-tunable config |
+| `04-postgres.yaml` | Postgres StatefulSet + 5Gi PVC |
+| `05` / `06` | Backend Deployment + Service |
+| `07` / `08` | Frontend Deployment + Service |
+| `09-ingress.yaml` | Optional, needs an ingress controller |
+| `10-networkpolicy.yaml` | frontend → backend → postgres only |
+| `11-servicemonitor.yaml` | Optional, needs the Prometheus Operator |
+
+The last two are commented out of `kustomization.yaml`; uncomment if your cluster has the
+prerequisites.
 
 ---
 
-## Security boundaries (`02-rbac.yaml` + code guards)
+## Security boundaries
 
-The agent has **broad write access** across API groups, deliberately — it is meant to fix real
-problems. What bounds it:
+The agent has broad write access on purpose — it exists to fix real problems. Three things bound it.
 
-**Enforced by RBAC (hard guarantees):**
-- **Secrets are unreadable.** The core group is enumerated with `secrets` left out, so no `get`/
-  `list` verb exists. The agent can *create/replace* a Secret, but never read one back.
+**RBAC makes Secrets unreadable.** The core API group is enumerated with `secrets` left out, so no
+`get`/`list` verb exists for them. The agent can create or replace a Secret, never read one back.
 
-**Enforced in code** (`k8s_tools.py`) — Kubernetes RBAC has no "deny" rule, so "everything except
-X" cannot be expressed there:
-- Cannot modify **its own RBAC** — its ServiceAccount, ClusterRole/Binding, anything in its own
-  namespace, or *any* binding whose subject is the agent (blocking by name alone is bypassable by
-  creating a new binding).
-- **System namespaces** (`kube-system`, `kube-public`, `kube-node-lease`, its own) are left alone
-  while healthy; writes are allowed once a workload there is genuinely broken.
-- **Destructive actions refused:** deleting a standalone Pod (nothing would recreate it), deleting
-  a Bound PersistentVolume, deleting a Node, and restarts that cannot possibly help (e.g.
-  `ImagePullBackOff` — the replacement pod fails identically).
+**Code guards** in `k8s_tools.py` cover what RBAC cannot express (there is no deny rule):
 
-**The real control is the human-approval gate** in `agents.py`
-(`interrupt_before=["select_issues", "apply_remediation", "propose_retry"]`). No write runs without
-someone approving it via `POST /api/decision`. Setting `REQUIRE_APPROVAL: "false"` in the ConfigMap
-removes that gate entirely — with broad write access that means an LLM changing your cluster
-unsupervised. Leave it `"true"` unless you have a specific reason.
+- It cannot touch its own RBAC — ServiceAccount, ClusterRole/Binding, anything in its own namespace,
+  or any binding whose subject is the agent.
+- System namespaces (`kube-system`, `kube-public`, `kube-node-lease`, its own) are left alone while
+  healthy, and writable once something there is genuinely broken.
+- Destructive actions are refused: deleting a standalone Pod, a Bound PersistentVolume or a Node,
+  and restarts that cannot help (an `ImagePullBackOff` pod comes back identical).
+
+**Human approval is the real control.** `interrupt_before` in `agents.py` stops the graph before
+every write until someone approves it. Setting `REQUIRE_APPROVAL: "false"` removes that gate
+entirely — an LLM changing your cluster unsupervised. Leave it `"true"` unless you have a reason.
 
 ---
 
-## Using a managed database
+## Managed database
 
-Remove `05-postgres.yaml` from `kustomization.yaml` and update `DATABASE_HOST`/`DATABASE_PORT`/
-`DATABASE_NAME`/`DATABASE_USER` in `03-configmap.yaml` plus `DATABASE_PASSWORD` in
-`04-secret.yaml`. No code change needed — `checkpointer.py` just reads the assembled `DATABASE_URL`.
+Remove `04-postgres.yaml` from `kustomization.yaml`, update `DATABASE_HOST`/`DATABASE_PORT`/
+`DATABASE_NAME`/`DATABASE_USER` in `03-configmap.yaml`, and set `DATABASE_PASSWORD` in the
+`secretGenerator` block. No code change needed.
 
 ## Resource sizing
 
 Backend `250m/256Mi` → `1/512Mi`; frontend `100m/128Mi` → `500m/256Mi`; Postgres `100m/256Mi` →
-`500m/512Mi`. Sized for a Python process making Bedrock and Kubernetes API calls, not local
-inference. Starting points, not measured values — adjust once you see real usage.
+`500m/512Mi`. Starting points, not measured values.

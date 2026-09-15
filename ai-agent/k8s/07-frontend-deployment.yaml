@@ -21,7 +21,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: frontend
-          image: docker.io/devopscube/ai-agent-frontend:v1.4.4
+          image: docker.io/devopscube/ai-agent-frontend:v1.7.1
           ports:
             - containerPort: 3000
           env:

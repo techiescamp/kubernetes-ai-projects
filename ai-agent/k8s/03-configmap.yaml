@@ -4,12 +4,6 @@ metadata:
   name: ai-agent-config
   namespace: ai-agent
 data:
-  AWS_REGION: "us-west-2"
-  DIAGNOSTICS_MODEL_ID: "us.amazon.nova-pro-v1:0"
-  REMEDIATION_MODEL_ID: "us.amazon.nova-pro-v1:0"
-  LOG_LEVEL: "INFO"
-  MAX_REMEDIATION_ATTEMPTS: "3"
-  REQUIRE_APPROVAL: "true"
   ALLOWED_ORIGINS: "http://(localhost|127\\.0\\.0\\.1):\\d+|http://ai-agent-frontend(\\.ai-agent)?(\\.svc)?(\\.cluster\\.local)?:\\d+"
   DATABASE_HOST: "ai-agent-postgres"
   DATABASE_PORT: "5432"
