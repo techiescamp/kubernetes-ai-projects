@@ -2,7 +2,7 @@ import logging
 import os
 import uuid
 
-from logging_config import configure_logging
+from app.infra.logging_config import configure_logging
 
 configure_logging()
 
@@ -12,11 +12,11 @@ from kubernetes import client as k8s_client
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 
-from agents import compiled_graph, MAX_ATTEMPTS, REQUIRE_APPROVAL, generate_proposal
-from conversation_store import ConversationStore
-from bedrock_clients import bedrock_client
-from metrics import metrics_app
-from usage_tracker import get_usage_dict
+from app.agent import compiled_graph, generate_proposal, MAX_ATTEMPTS, REQUIRE_APPROVAL
+from app.infra.conversation_store import ConversationStore
+from app.infra.bedrock import bedrock_client
+from app.infra.metrics import metrics_app
+from app.infra.usage_tracker import get_usage_dict
 
 logger = logging.getLogger(__name__)
 

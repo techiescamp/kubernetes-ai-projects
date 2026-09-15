@@ -4,22 +4,22 @@ kind: Kustomization
 namespace: ai-agent
 
 resources:
-  - 00-namespace.yaml
-  - 01-serviceaccount.yaml
-  - 02-rbac.yaml
-  - 03-configmap.yaml
-  - 04-postgres.yaml
-  - 05-backend-deployment.yaml
-  - 06-backend-service.yaml
-  - 07-frontend-deployment.yaml
-  - 08-frontend-service.yaml
-  - 10-networkpolicy.yaml
-#  - 09-ingress.yaml
-#  - 11-servicemonitor.yaml
+  - manifests/namespace.yaml
+  - manifests/serviceaccount.yaml
+  - manifests/rbac.yaml
+  - manifests/configmap.yaml
+  - manifests/postgres.yaml
+  - manifests/backend-deployment.yaml
+  - manifests/backend-service.yaml
+  - manifests/frontend-deployment.yaml
+  - manifests/frontend-service.yaml
+  - manifests/networkpolicy.yaml
+#  - manifests/ingress.yaml
+#  - manifests/servicemonitor.yaml
 
 images:
   - name: docker.io/devopscube/ai-agent-backend
-    newTag: v1.4.4
+    newTag: v1.5.0
   - name: docker.io/devopscube/ai-agent-frontend
     newTag: v1.7.1
 

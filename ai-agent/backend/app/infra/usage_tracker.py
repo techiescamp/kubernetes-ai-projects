@@ -1,7 +1,7 @@
 import os
 from collections import defaultdict
 
-from metrics import LLM_TOKENS
+from .metrics import LLM_TOKENS
 
 
 def _price(env_var: str) -> float:

@@ -3,7 +3,7 @@
 A LangGraph multi-agent that diagnoses and (with human approval) remediates Kubernetes problems
 using AWS Bedrock (Amazon Nova Pro for both diagnostics/verification and remediation - see
 `backend/bedrock_clients.py`). Exposed via a FastAPI backend and a Next.js chat UI, with a
-`diagnose -> propose fix -> [human approval] -> apply -> verify -> retry` loop (`backend/agents.py`).
+`diagnose -> propose fix -> [human approval] -> apply -> verify -> retry` loop (`backend/app/agent/`).
 
 ## Structure
 
@@ -20,7 +20,7 @@ ai-agent/
 cd backend
 cp .env.example .env   # fill in AWS_REGION, model IDs, and any other values you want to set
 pip install -r requirements.txt
-python main.py          # backend on http://127.0.0.1:8000
+uvicorn app.main:app          # backend on http://127.0.0.1:8000
 
 cd ../frontend
 npm install
@@ -42,9 +42,9 @@ step-by-step deploy guide.
 
 | File | Purpose |
 |---|---|
-| `backend/agents.py` | LangGraph state machine - the diagnose/propose/apply/verify/retry loop |
-| `backend/k8s_tools.py` | Kubernetes API tools the agent calls (read-only diagnostics + write remediation) |
-| `backend/main.py` | FastAPI backend - `/api/query`, `/api/decision`, `/api/retry`, `/healthz`, `/readyz`, `/metrics` |
+| `backend/app/agent/` | LangGraph state machine - the diagnose/propose/apply/verify/retry loop |
+| `backend/app/tools/` | Kubernetes API tools the agent calls (read-only diagnostics + write remediation) |
+| `backend/app/main.py` | FastAPI backend - `/api/query`, `/api/decision`, `/api/retry`, `/healthz`, `/readyz`, `/metrics` |
 | `backend/bedrock_clients.py` | AWS Bedrock model client factory |
 | `backend/checkpointer.py` | LangGraph checkpoint storage - Postgres (connection pool) if `DATABASE_URL` is set, in-memory otherwise |
 | `backend/usage_tracker.py` | Token usage/cost tracking |

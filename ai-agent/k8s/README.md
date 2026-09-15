@@ -16,15 +16,15 @@ kubectl cluster-info
 kubectl get storageclass          # at least one marked (default)
 ```
 
-**AWS credentials.** On EKS run `./setup-pod-identity.sh create` — it creates the IAM role and maps
-it to the ServiceAccount, so no keys go in any file. `./setup-pod-identity.sh cleanup` removes both
+**AWS credentials.** On EKS run `../scripts/setup-pod-identity.sh create` — it creates the IAM role and maps
+it to the ServiceAccount, so no keys go in any file. `../scripts/setup-pod-identity.sh cleanup` removes both
 again. Edit `CLUSTER_NAME` at the top of the script first.
 
-Anywhere else, uncomment the two `AWS_*` literals in the `secretGenerator` block of
-`kustomization.yaml`.
+Anywhere else, uncomment `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the `secretGenerator`
+block of `kustomization.yaml`.
 
-On EKS those lines must stay commented. Environment variables beat the Pod Identity endpoint in
-boto3's credential chain, so any value there overrides the role and every Bedrock call fails with
+On EKS leave them commented. Environment variables beat the Pod Identity endpoint in boto3's
+credential chain, so any value there overrides the role and every Bedrock call fails with
 `InvalidClientTokenId`.
 
 ---
@@ -72,11 +72,13 @@ If your images are public, delete the `imagePullSecrets` block from the two Depl
 
 ## Deploy
 
-Set `DATABASE_PASSWORD` and `POSTGRES_PASSWORD` in `kustomization.yaml`. **They must match** —
-Postgres only reads its password at first `initdb`, so changing it later on an existing volume also
-needs an `ALTER USER`.
+Set `DATABASE_PASSWORD` and `POSTGRES_PASSWORD` in the `secretGenerator` block of
+`kustomization.yaml`. They **must match** — Postgres only reads its password at first `initdb`, so
+changing it later on an existing volume also needs an `ALTER USER`.
 
-> Once filled in, `kustomization.yaml` holds real credentials. Keep it out of version control.
+> Once filled in, `kustomization.yaml` contains real credentials. Keep it out of version control, or
+> delete the `secretGenerator` block and create the two Secrets with `kubectl create secret generic`
+> instead.
 
 ```sh
 cd ai-agent
@@ -84,7 +86,7 @@ cd ai-agent
 kubectl kustomize k8s/          # render, change nothing
 kubectl apply -k k8s/           # create/update everything
 kubectl diff -k k8s/            # what would change
-kubectl delete -k k8s/          # tear down (then ./k8s/setup-pod-identity.sh cleanup on EKS)
+kubectl delete -k k8s/          # tear down (then ./scripts/setup-pod-identity.sh cleanup on EKS)
 ```
 
 Check it came up:
@@ -118,7 +120,7 @@ curl -sS http://localhost:8000/healthz
 
 **Expose the frontend only, never the backend.** The API has no authentication — anyone who reaches
 it can make the agent change your cluster. If you serve the frontend on a real hostname, add that
-origin to `ALLOWED_ORIGINS` in `03-configmap.yaml`.
+origin to `ALLOWED_ORIGINS` in `manifests/configmap.yaml`.
 
 ---
 
@@ -127,23 +129,12 @@ origin to `ALLOWED_ORIGINS` in `03-configmap.yaml`.
 | Where | What |
 |---|---|
 | `kustomization.yaml` | Region, model IDs, prices, `REQUIRE_APPROVAL`, image tags, replicas, passwords |
-| `03-configmap.yaml` | Database host/port/name/user, `BACKEND_URL`, CORS |
+| `manifests/configmap.yaml` | Database host/port/name/user, `BACKEND_URL`, CORS |
 
-| File | Purpose |
-|---|---|
-| `00-namespace.yaml` | `ai-agent` namespace |
-| `01-serviceaccount.yaml` | Agent identity |
-| `02-rbac.yaml` | ClusterRole + binding |
-| `03-configmap.yaml` | Non-tunable config |
-| `04-postgres.yaml` | Postgres StatefulSet + 5Gi PVC |
-| `05` / `06` | Backend Deployment + Service |
-| `07` / `08` | Frontend Deployment + Service |
-| `09-ingress.yaml` | Optional, needs an ingress controller |
-| `10-networkpolicy.yaml` | frontend → backend → postgres only |
-| `11-servicemonitor.yaml` | Optional, needs the Prometheus Operator |
-
-The last two are commented out of `kustomization.yaml`; uncomment if your cluster has the
-prerequisites.
+The manifests live in `k8s/manifests/`; `k8s/kustomization.yaml` sits outside them and lists the
+ones that get applied. `manifests/ingress.yaml` and `manifests/servicemonitor.yaml` are commented
+out of that list — uncomment them if your cluster has an ingress controller / the Prometheus
+Operator.
 
 ---
 
@@ -154,7 +145,7 @@ The agent has broad write access on purpose — it exists to fix real problems. 
 **RBAC makes Secrets unreadable.** The core API group is enumerated with `secrets` left out, so no
 `get`/`list` verb exists for them. The agent can create or replace a Secret, never read one back.
 
-**Code guards** in `k8s_tools.py` cover what RBAC cannot express (there is no deny rule):
+**Code guards** in `app/tools/guards.py` cover what RBAC cannot express (there is no deny rule):
 
 - It cannot touch its own RBAC — ServiceAccount, ClusterRole/Binding, anything in its own namespace,
   or any binding whose subject is the agent.
@@ -163,7 +154,7 @@ The agent has broad write access on purpose — it exists to fix real problems. 
 - Destructive actions are refused: deleting a standalone Pod, a Bound PersistentVolume or a Node,
   and restarts that cannot help (an `ImagePullBackOff` pod comes back identical).
 
-**Human approval is the real control.** `interrupt_before` in `agents.py` stops the graph before
+**Human approval is the real control.** `interrupt_before` in `app/agent/graph.py` stops the graph before
 every write until someone approves it. Setting `REQUIRE_APPROVAL: "false"` removes that gate
 entirely — an LLM changing your cluster unsupervised. Leave it `"true"` unless you have a reason.
 
@@ -171,8 +162,8 @@ entirely — an LLM changing your cluster unsupervised. Leave it `"true"` unless
 
 ## Managed database
 
-Remove `04-postgres.yaml` from `kustomization.yaml`, update `DATABASE_HOST`/`DATABASE_PORT`/
-`DATABASE_NAME`/`DATABASE_USER` in `03-configmap.yaml`, and set `DATABASE_PASSWORD` in the
+Remove `manifests/postgres.yaml` from `kustomization.yaml`, update `DATABASE_HOST`/`DATABASE_PORT`/
+`DATABASE_NAME`/`DATABASE_USER` in `manifests/configmap.yaml`, and set `DATABASE_PASSWORD` in the
 `secretGenerator` block. No code change needed.
 
 ## Resource sizing

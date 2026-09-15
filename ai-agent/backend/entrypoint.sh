@@ -24,4 +24,4 @@ if database_url:
         sys.exit(f'DATABASE_URL is set but Postgres is unreachable: {e}')
 "
 
-exec uvicorn main:app --host 0.0.0.0 --port 8000
+exec uvicorn app.main:app --host 0.0.0.0 --port 8000

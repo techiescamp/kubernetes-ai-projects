@@ -9,7 +9,8 @@ RUN useradd -u 10001 -m appuser
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY *.py entrypoint.sh ./
+COPY app ./app
+COPY entrypoint.sh ./
 RUN chmod +x entrypoint.sh && chown -R appuser:appuser /app
 
 USER appuser

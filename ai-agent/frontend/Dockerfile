@@ -13,7 +13,6 @@ FROM node:22-slim AS runner
 WORKDIR /app
 RUN useradd -u 10001 -m appuser
 ENV NODE_ENV=production
-COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 USER appuser
