@@ -86,6 +86,38 @@ def invoke_tool_safely(tool_func, args: dict) -> str:
         return f"Error: invalid arguments for this tool call - {e}. Check the tool's required arguments and retry."
 
 
+_TAG_FLAGS = {"remediation_needed": "REMEDIATION_NEEDED", "goal_achieved": "GOAL_ACHIEVED"}
+
+
+def _normalise_model_markup(text: str) -> str:
+    """
+    Rewrite the model's XML-ish dialect into the canonical line format the parsers expect.
+
+    The prompt asks for 'ISSUE: ...' lines and a trailing 'REMEDIATION_NEEDED: YES'. Nova Pro
+    sometimes answers in tags instead - a real deployed run produced
+    '<issue> ... </issue> <remediation_needed> YES </remediation_needed>', which no parser matched:
+    the tags were shown to the user verbatim AND the flag read as NO while the model had said YES,
+    so the graph would have ended instead of proposing a fix.
+
+    Normalising here rather than teaching each parser about tags keeps one place that knows the
+    model's formatting varies. The final rule unwraps any other PAIRED tag the model invents while
+    leaving unpaired angle brackets alone, so kubectl output like '<none>' survives intact.
+    """
+    text = re.sub(
+        r"<issue>\s*(.*?)\s*</issue>",
+        lambda m: "\nISSUE: " + " ".join(m.group(1).split()) + "\n",
+        text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    for tag, flag in _TAG_FLAGS.items():
+        text = re.sub(
+            rf"<{tag}>\s*(YES|NO)\s*</{tag}>",
+            lambda m, f=flag: f"\n{f}: {m.group(1).upper()}\n",
+            text, flags=re.IGNORECASE,
+        )
+    text = re.sub(r"<([a-z][a-z0-9_-]*)>(.*?)</\1>", r"\2", text, flags=re.DOTALL | re.IGNORECASE)
+    return text
+
+
 def _strip_reasoning_markup(text: str) -> str:
     """
     Remove the model's internal monologue from anything a human will read.
@@ -101,6 +133,7 @@ def _strip_reasoning_markup(text: str) -> str:
     text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<thinking>.*$", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"</?response>", "", text, flags=re.IGNORECASE)
+    text = _normalise_model_markup(text)
     for _ in range(3):
         stripped = re.sub(
             r"^\s*(Diagnostic Report|Proposed Fix|Proposed Remediation|Remediation Plan|"
@@ -128,9 +161,13 @@ def _extract_flag(text: str, flag: str) -> tuple:
     flag is now parsed into a real state field and stripped from the text the user reads - the UI
     already conveys the same thing through the proposal/approval buttons and the goal badge.
     """
-    match = re.search(rf"^\s*{flag}:\s*(YES|NO)\b.*$", text, re.MULTILINE | re.IGNORECASE)
+    # Deliberately NOT anchored to the start of a line: the model also appends the flag to the end
+    # of its last sentence ("There are 2 nodes in the cluster. REMEDIATION_NEEDED: NO"), and a
+    # line-anchored pattern left that visible in the UI while reading the flag as absent.
+    pattern = rf"\s*{flag}\s*[:=]\s*(YES|NO)\b[^\n]*"
+    match = re.search(pattern, text, re.IGNORECASE)
     is_yes = bool(match) and match.group(1).upper() == "YES"
-    cleaned = re.sub(rf"^\s*{flag}:\s*(YES|NO)\b.*$", "", text, flags=re.MULTILINE | re.IGNORECASE)
+    cleaned = re.sub(pattern, "", text, flags=re.IGNORECASE)
     return is_yes, re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 

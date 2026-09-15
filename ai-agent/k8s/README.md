@@ -2,8 +2,6 @@
 
 Backend (LangGraph + FastAPI), frontend (Next.js chat UI), and Postgres for durable state.
 
-For a step-by-step EKS install, see [`../step.md`](../step.md).
-
 ---
 
 ## Prerequisites
@@ -18,9 +16,12 @@ kubectl cluster-info
 kubectl get storageclass          # at least one marked (default)
 ```
 
-**AWS credentials.** On EKS run `./setup-pod-identity.sh` — it creates the IAM role and maps it to
-the ServiceAccount, and no keys go in any file. Anywhere else, uncomment the two `AWS_*` literals in
-the `secretGenerator` block of `kustomization.yaml`.
+**AWS credentials.** On EKS run `./setup-pod-identity.sh create` — it creates the IAM role and maps
+it to the ServiceAccount, so no keys go in any file. `./setup-pod-identity.sh cleanup` removes both
+again. Edit `CLUSTER_NAME` at the top of the script first.
+
+Anywhere else, uncomment the two `AWS_*` literals in the `secretGenerator` block of
+`kustomization.yaml`.
 
 On EKS those lines must stay commented. Environment variables beat the Pod Identity endpoint in
 boto3's credential chain, so any value there overrides the role and every Bedrock call fails with
@@ -83,7 +84,7 @@ cd ai-agent
 kubectl kustomize k8s/          # render, change nothing
 kubectl apply -k k8s/           # create/update everything
 kubectl diff -k k8s/            # what would change
-kubectl delete -k k8s/          # tear down
+kubectl delete -k k8s/          # tear down (then ./k8s/setup-pod-identity.sh cleanup on EKS)
 ```
 
 Check it came up:
