@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CLUSTER_NAME="bibin-eks-cluster"
+CLUSTER_NAME="eks-cluster"
 AWS_REGION="us-west-2"
 NAMESPACE="ai-agent"
 SERVICE_ACCOUNT="ai-agent"
