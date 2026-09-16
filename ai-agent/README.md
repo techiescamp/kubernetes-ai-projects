@@ -10,9 +10,9 @@ using AWS Bedrock (Amazon Nova Pro for both diagnostics/verification and remedia
 
 ```
 ai-agent/
-  agent-backend/   Python/FastAPI agent
-  agent-ui/        Next.js chat UI
-  k8s/             Kubernetes deployment manifests, RBAC, and deploy instructions
+  agent-backend/    Python/FastAPI agent
+  agent-interface/  Next.js chat UI
+  k8s/              Kubernetes deployment manifests, RBAC, and deploy instructions
 ```
 
 ## Local development
@@ -23,7 +23,7 @@ cp .env.example .env   # fill in AWS_REGION, model IDs, and any other values you
 pip install -r requirements.txt
 uvicorn app.main:app          # backend on http://127.0.0.1:8000
 
-cd ../agent-ui
+cd ../agent-interface
 npm install
 npm run dev              # frontend on http://localhost:3000
 ```
@@ -50,5 +50,5 @@ step-by-step deploy guide.
 | `agent-backend/app/infra/checkpointer.py` | LangGraph checkpoint storage - Postgres (connection pool) if `DATABASE_URL` is set, in-memory otherwise |
 | `agent-backend/app/infra/usage_tracker.py` | Token usage/cost tracking |
 | `agent-backend/Dockerfile` | Backend container image |
-| `agent-ui/` | Next.js chat UI (own `Dockerfile`) |
+| `agent-interface/` | Next.js chat UI (own `Dockerfile`) |
 | `k8s/` | Kubernetes deployment manifests, RBAC, and deploy instructions |

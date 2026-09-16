@@ -21,7 +21,7 @@ images:
   - name: docker.io/devopscube/ai-agent-backend
     newTag: v1.7.1
   - name: docker.io/devopscube/ai-agent-frontend
-    newTag: v1.8.1
+    newTag: v1.8.2
 
 replicas:
   - name: ai-agent-backend

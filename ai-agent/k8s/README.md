@@ -38,7 +38,7 @@ export REGISTRY=docker.io/<your-username>
 export TAG=v1.0.0
 
 docker build -t $REGISTRY/ai-agent-backend:$TAG  agent-backend/
-docker build -t $REGISTRY/ai-agent-frontend:$TAG agent-ui/
+docker build -t $REGISTRY/ai-agent-frontend:$TAG agent-interface/
 docker push $REGISTRY/ai-agent-backend:$TAG
 docker push $REGISTRY/ai-agent-frontend:$TAG
 ```

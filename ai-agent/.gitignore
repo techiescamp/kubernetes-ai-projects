@@ -5,8 +5,8 @@ __pycache__/
 
 venv/
 
-agent-ui/node_modules/
-agent-ui/.next/
-agent-ui/next-env.d.ts
-agent-ui/*.tsbuildinfo
+agent-interface/node_modules/
+agent-interface/.next/
+agent-interface/next-env.d.ts
+agent-interface/*.tsbuildinfo
 
