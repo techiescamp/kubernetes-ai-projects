@@ -27,18 +27,7 @@ _ALLOWED_KINDS = {
 }
 _ALLOWED_KINDS_CI = {k.lower(): k for k in _ALLOWED_KINDS}
 
-
 def _api_error_message(e) -> str:
-    """
-    Pull the human-readable reason out of a Kubernetes ApiException.
-
-    str(ApiException) dumps the status line, every HTTP response header, the raw JSON body AND a
-    full Python traceback - hundreds of tokens where one sentence carries all the meaning. That
-    whole wall gets fed back to the model as a tool result, which buries the actual cause (a real
-    deployed test had "spec.accessModes: Required value" lost inside a traceback, and the model
-    burned an extra remediation attempt as a result) and wastes context. Return just the API
-    server's own 'message' field when it can be parsed, falling back to reason/status.
-    """
     try:
         body = json.loads(e.body)
         msg = body.get("message")
@@ -47,4 +36,3 @@ def _api_error_message(e) -> str:
     except Exception:
         pass
     return f"{getattr(e, 'reason', 'error')} (HTTP {getattr(e, 'status', '?')})"
-

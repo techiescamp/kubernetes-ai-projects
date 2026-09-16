@@ -111,15 +111,6 @@ def update_pod_image(pod_name: str, container_name: str, image: str, namespace: 
 
 
 def _real_container_names(apps_v1, deployment_name: str, namespace: str) -> list:
-    """
-    Reads a Deployment's actual container names. A strategic merge patch on
-    spec.template.spec.containers matches list entries by 'name' - if the given name doesn't
-    match any existing container, Kubernetes doesn't error, it silently APPENDS a new container
-    entry instead (unlike the equivalent Pod-level patch, which correctly rejects this). A real
-    deployed test caught exactly this: a wrong container_name guess quietly turned a one-container
-    Deployment into a broken two-container one instead of failing loudly. Tools that patch the
-    containers list call this first and refuse (with the real names) rather than risk that.
-    """
     deployment = apps_v1.read_namespaced_deployment(name=deployment_name, namespace=namespace)
     return [c.name for c in deployment.spec.template.spec.containers]
 

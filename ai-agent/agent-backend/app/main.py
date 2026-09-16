@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Kubernetes Diagnosis & Remediation Agent API", version="1.0.0")
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=os.getenv("ALLOWED_ORIGINS", r"http://(localhost|127\.0\.0\.1):\d+"),
@@ -35,62 +34,42 @@ app.mount("/metrics", metrics_app)
 
 memory = ConversationStore()
 
-
 class QueryRequest(BaseModel):
     query: str
-
 
 class DecisionRequest(BaseModel):
     session_id: str
     approved: bool
 
-
 class RetryRequest(BaseModel):
     session_id: str
     retry: bool
-
 
 class GuidanceRequest(BaseModel):
     session_id: str
     instruction: str
 
-
 class IssueSelectionRequest(BaseModel):
     session_id: str
     selected_indices: list[int] = []
 
-
 def _get_state(session_id: str):
-    """
-    Looks up a paused graph thread by session_id. The checkpointer (not a local dict)
-    is the source of truth for session state; an empty snapshot means the thread was
-    never started or already ran to completion.
-    """
     config = {"configurable": {"thread_id": session_id}}
     snapshot = compiled_graph.get_state(config)
     if not snapshot.values:
         raise HTTPException(status_code=404, detail="Unknown or already-completed session_id.")
     return config, snapshot
 
-
 @app.get("/api/health")
 def health_check():
-    """Deprecated alias for /healthz, kept for compatibility with the current frontend."""
     return {"status": "ok", "backend": "FastAPI"}
-
 
 @app.get("/healthz")
 def liveness():
-    """Liveness probe target: process is up, no external calls. Always fast."""
     return {"status": "ok", "require_approval": REQUIRE_APPROVAL}
-
 
 @app.get("/readyz")
 def readiness():
-    """
-    Readiness probe target: confirms the pod can actually do its job (reach the Kubernetes API
-    and has a usable Bedrock client) before Kubernetes routes traffic to it.
-    """
     try:
         k8s_client.CoreV1Api().list_namespace(limit=1, _request_timeout=3)
     except Exception as e:
@@ -103,11 +82,9 @@ def readiness():
         raise HTTPException(status_code=503, detail=f"bedrock client misconfigured: {e}")
     return {"status": "ready"}
 
-
 @app.get("/api/usage")
 def usage():
     return get_usage_dict()
-
 
 @app.post("/api/query")
 def submit_query(request: QueryRequest):
@@ -184,7 +161,6 @@ def submit_query(request: QueryRequest):
         "diagnostic_report": diag_report,
         "proposed_fix": proposed_fix,
     }
-
 
 @app.post("/api/decision")
 def submit_decision(request: DecisionRequest):
@@ -277,7 +253,6 @@ def submit_decision(request: DecisionRequest):
         "max_attempts": MAX_ATTEMPTS,
     }
 
-
 @app.post("/api/retry")
 def submit_retry(request: RetryRequest):
     config, snapshot = _get_state(request.session_id)
@@ -312,17 +287,8 @@ def submit_retry(request: RetryRequest):
         "max_attempts": MAX_ATTEMPTS,
     }
 
-
 @app.post("/api/select-issues")
 def submit_issue_selection(request: IssueSelectionRequest):
-    """
-    Resumes a session paused at select_issues (diagnose_node found more than one distinct
-    problem) with the human's choice of which issue(s) to actually act on. Narrows
-    diagnostic_report to just the selected issue(s) before letting propose_remediation run, so a
-    fix only ever gets proposed/applied for what the human picked - the other issue(s) found are
-    left untouched and simply not mentioned again for this session. Empty/omitted
-    selected_indices means "fix everything that was found."
-    """
     config, snapshot = _get_state(request.session_id)
     state = snapshot.values
     issues = state.get("issues", [])
@@ -350,17 +316,8 @@ def submit_issue_selection(request: IssueSelectionRequest):
         "proposed_fix": output_state.get("proposed_fix", ""),
     }
 
-
 @app.post("/api/guidance")
 def submit_guidance(request: GuidanceRequest):
-    """
-    Lets a human redirect the proposed fix with a free-text instruction instead of only
-    Approve/Reject - e.g. "no, attach it via envFrom, not an annotation" - covering both the
-    very first proposal and a post-verification retry proposal. Always produces a fresh,
-    human-reviewable proposal rather than auto-applying the instruction: arbitrary free text
-    changing what gets run on the cluster deserves a look before it's approved, same as any
-    other proposal.
-    """
     instruction = request.instruction.strip()
     if not instruction:
         raise HTTPException(status_code=400, detail="Instruction cannot be empty.")
@@ -404,7 +361,6 @@ def submit_guidance(request: GuidanceRequest):
         }
 
     raise HTTPException(status_code=409, detail="Session is not currently awaiting a decision.")
-
 
 if __name__ == "__main__":
     import uvicorn

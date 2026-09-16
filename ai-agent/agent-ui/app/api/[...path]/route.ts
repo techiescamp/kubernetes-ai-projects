@@ -1,11 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Proxies the browser's relative /api/* calls to the real backend, server-side. Deliberately a
-// Route Handler (not next.config.ts's rewrites()) - rewrites() gets resolved into the standalone
-// build's routing manifest at `next build` time, so it never sees a runtime-only BACKEND_URL (a
-// real deployed test caught this: the proxy kept hitting the build-time default instead of the
-// actual backend Service). A Route Handler runs per-request on the server, so it reads
-// process.env fresh every time - this is what makes BACKEND_URL truly runtime-configurable.
 function backendUrl(): string {
   return process.env.BACKEND_URL || "http://127.0.0.1:8000";
 }

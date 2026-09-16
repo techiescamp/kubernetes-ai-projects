@@ -15,8 +15,6 @@ REMEDIATION_OUTCOMES = Counter(
 
 metrics_app = make_asgi_app()
 
-
 def record_tool_call(tool_name: str, result) -> None:
-    """Classifies a tool's string result as success/error for the agent_tool_calls_total counter."""
     outcome = "error" if str(result).lower().startswith("error") else "success"
     TOOL_CALLS.labels(tool=tool_name, outcome=outcome).inc()

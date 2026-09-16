@@ -10,15 +10,7 @@ PROTECTED_NAMESPACES = {"kube-system", "kube-public", "kube-node-lease", AGENT_N
 _RBAC_KINDS = {"role", "clusterrole", "rolebinding", "clusterrolebinding"}
 _BINDING_KINDS = {"rolebinding", "clusterrolebinding"}
 
-
 def _targets_agent_identity(kind: str, name: str, namespace: Optional[str], body: Optional[dict]) -> bool:
-    """
-    True if this write would change the agent's OWN permissions.
-
-    Blocking by object name alone is not enough: the obvious escalation is to create a BRAND NEW
-    ClusterRoleBinding (any name at all) whose subject is this agent's ServiceAccount, bound to
-    cluster-admin. So the subjects of any binding being written are inspected too.
-    """
     k = (kind or "").lower()
     if k not in _RBAC_KINDS and k != "serviceaccount":
         return False
@@ -42,14 +34,7 @@ def _targets_agent_identity(kind: str, name: str, namespace: Optional[str], body
                 return True
     return False
 
-
 def _target_is_unhealthy(kind: str, name: str, namespace: Optional[str]) -> Optional[bool]:
-    """
-    Is this object currently broken? None means "couldn't tell".
-
-    Used to allow writes in protected namespaces only once something is actually failing there,
-    which is what the owner asked for: hands off the system components until they break.
-    """
     k = (kind or "").lower()
     try:
         v1 = client.CoreV1Api()
@@ -82,7 +67,6 @@ def _target_is_unhealthy(kind: str, name: str, namespace: Optional[str]) -> Opti
         return None
     return None
 
-
 _SPEC_BAKED_REASONS = {
     "CreateContainerConfigError": "a referenced ConfigMap/Secret or key is missing or wrong",
     "ImagePullBackOff": "the image cannot be pulled (wrong name/tag or missing credentials)",
@@ -92,15 +76,7 @@ _SPEC_BAKED_REASONS = {
     "RunContainerError": "the container cannot be started from this spec",
 }
 
-
 def _restart_would_not_help(pod) -> Optional[str]:
-    """
-    If the pod is failing for a reason a restart cannot possibly clear, return an explanation.
-
-    Restarting is the classic non-fix: it looks like action, changes nothing, and the pod comes
-    back in exactly the same state because the fault lives in the spec, not in the running
-    container. Detect that case and say what to patch instead.
-    """
     statuses = list(pod.status.container_statuses or []) + list(pod.status.init_container_statuses or [])
     for cs in statuses:
         waiting = getattr(cs.state, "waiting", None) if cs.state else None
@@ -116,18 +92,8 @@ def _restart_would_not_help(pod) -> Optional[str]:
                 )
     return None
 
-
 def check_write_allowed(kind: str, name: str, namespace: Optional[str] = None,
                         body: Optional[dict] = None) -> Optional[str]:
-    """
-    Gate every write. Returns a refusal message, or None when the write may proceed.
-
-    Three rules, all requested explicitly by the cluster owner:
-      1. Never modify the agent's own RBAC (it must not be able to grant itself more access).
-      2. Never read Secret values (enforced in the read tools; Secrets remain writable).
-      3. Don't touch system namespaces while they are healthy - only once something there is
-         actually broken, which is exactly when the agent is supposed to help.
-    """
     if _targets_agent_identity(kind, name, namespace, body):
         return (
             f"REFUSED: {kind}/{name} controls this agent's own permissions. The agent is not "
@@ -155,4 +121,3 @@ def check_write_allowed(kind: str, name: str, namespace: Optional[str] = None,
                 f"first and only act on a confirmed failure."
             )
     return None
-

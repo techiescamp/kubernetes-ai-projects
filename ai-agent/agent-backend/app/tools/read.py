@@ -753,7 +753,6 @@ def get_resource_usage(namespace: Optional[str] = None) -> str:
 
 
 def _strip_noise(obj: dict) -> dict:
-    """Removes routinely huge, low-diagnostic-value fields before returning an object to the LLM."""
     if not isinstance(obj, dict):
         return obj
     meta = obj.get("metadata")

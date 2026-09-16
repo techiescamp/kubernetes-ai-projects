@@ -12,8 +12,6 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    // data-theme is set before paint by the script below, then kept in sync by the app, so the
-    // page never flashes the wrong theme on load.
     <html lang="en" data-theme="dark" suppressHydrationWarning>
       <head>
         <script

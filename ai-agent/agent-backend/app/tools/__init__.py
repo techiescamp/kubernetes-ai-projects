@@ -1,10 +1,4 @@
-"""
-Kubernetes tools, split by what they are allowed to do.
-
-`kube` is imported first and on purpose: importing it loads the in-cluster (or kubeconfig)
-credentials that every other module here depends on.
-"""
-from . import kube  # noqa: F401  - import for the credential load side effect
+from . import kube
 
 from .read import (
     check_permission, list_namespaces, get_pod_status, get_pod_logs, get_pod_events, describe_pod,

@@ -3,11 +3,8 @@ from collections import defaultdict
 
 from .metrics import LLM_TOKENS
 
-
 def _price(env_var: str) -> float:
-    """Reads an optional $/1K-token price from the environment. Blank or unset -> 0 (no cost estimate)."""
     return float(os.getenv(env_var, "") or "0")
-
 
 _PRICING = {
     "diagnostics": {
@@ -22,12 +19,7 @@ _PRICING = {
 
 _usage = defaultdict(lambda: {"input_tokens": 0, "output_tokens": 0, "calls": 0})
 
-
 def record_usage(role: str, response) -> None:
-    """
-    Accumulate token usage for a model call. `role` is 'diagnostics' or 'remediation'.
-    Reads usage_metadata off the AIMessage returned by ChatBedrock/ChatBedrockConverse.
-    """
     meta = getattr(response, "usage_metadata", None)
     if not meta:
         return
@@ -40,9 +32,7 @@ def record_usage(role: str, response) -> None:
     LLM_TOKENS.labels(role=role, direction="input").inc(input_tokens)
     LLM_TOKENS.labels(role=role, direction="output").inc(output_tokens)
 
-
 def get_summary() -> str:
-    """Human-readable running total of tokens (and cost, if pricing env vars are set)."""
     if not _usage:
         return "Token usage this session: no model calls recorded yet."
 
@@ -72,9 +62,7 @@ def get_summary() -> str:
         header += " (set *_MODEL_PRICE_*_PER_1K env vars in .env for a cost estimate)"
     return header + ":\n" + "\n".join(lines)
 
-
 def get_usage_dict() -> dict:
-    """Structured running total of tokens/cost per role, for API/UI consumption."""
     roles = {}
     total_cost = 0.0
     cost_available = False

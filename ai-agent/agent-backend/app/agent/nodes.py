@@ -19,7 +19,6 @@ from .state import MAX_ATTEMPTS, REQUIRE_APPROVAL, AgentState
 logger = logging.getLogger(__name__)
 
 def _timed_node(node_name: str):
-    """Decorator that records a LangGraph node's execution duration in GRAPH_NODE_SECONDS."""
     def decorator(func):
         def wrapper(state):
             with GRAPH_NODE_SECONDS.labels(node=node_name).time():
@@ -27,32 +26,14 @@ def _timed_node(node_name: str):
         return wrapper
     return decorator
 
-
 def invoke_tool_safely(tool_func, args: dict) -> str:
-    """
-    Each @tool function in k8s_tools.py catches its OWN internal exceptions and returns an error
-    string - but argument VALIDATION (the model omitting a required argument, wrong type, etc.)
-    happens in LangChain's tool-invocation layer, BEFORE the function body ever runs, and raises a
-    raw pydantic ValidationError straight out of .invoke() uncaught. A real deployed test hit
-    exactly this - the model called update_pod_image without its required container_name argument,
-    which crashed the whole /api/decision request with an HTTP 500 instead of giving the model a
-    chance to see what was wrong and retry. Catching it here and returning a normal error STRING
-    (fed back as a tool result, same as every other "you got something wrong" case already handled
-    in these loops) lets the model self-correct instead of crashing the request.
-    """
     try:
         return tool_func.invoke(args)
     except Exception as e:
         return f"Error: invalid arguments for this tool call - {e}. Check the tool's required arguments and retry."
 
-
-
 @_timed_node("diagnose")
 def diagnose_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Nova Pro model node.
-    Performs cluster inspections using diagnostic tools to understand the root cause of the issue.
-    """
     model = get_diagnostics_model()
     model_with_tools = model.bind_tools(diag_tools)
 
@@ -183,22 +164,6 @@ def diagnose_node(state: AgentState) -> Dict[str, Any]:
     }
 
 def generate_proposal(diagnostic_report: str, user_request: str, retry_context: str = "") -> str:
-    """
-    Core "propose a fix" logic, factored out of propose_remediation_node so main.py's guidance
-    endpoint can generate a redirected proposal (incorporating a human's free-text instruction)
-    without running it through the graph - the graph has no node to "re-propose before the first
-    attempt", only a dedicated retry path for after a failed verification.
-
-    Bound to the read-only diag_tools (not remedy_tools - this step only plans, never executes) so
-    the model can double-check a resource's EXACT current spec before finalizing a patch, instead
-    of relying entirely on whatever diagnose_node's natural-language report happened to preserve. A
-    real deployed test caught the gap this closes: the diagnostic report said a container's
-    ConfigMap reference was broken, but didn't spell out the container's exact env/envFrom
-    structure - the model (with no tools here, previously) proposed a patch that only ADDED the
-    correct envFrom, leaving the pre-existing broken env entry untouched (Kubernetes still refuses
-    to start the container while ANY referenced ConfigMap is missing, old or new), and the fix
-    silently failed to resolve anything despite being "applied successfully."
-    """
     model = get_remediation_model()
     model_with_tools = model.bind_tools(diag_tools)
 
@@ -266,13 +231,8 @@ def generate_proposal(diagnostic_report: str, user_request: str, retry_context: 
 
     return clean_message_content(curr_messages[-1].content)
 
-
 @_timed_node("propose_remediation")
 def propose_remediation_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Remediation model node (Propose Fix).
-    Analyzes the diagnostics report and proposes specific remediation actions.
-    """
     final_response = generate_proposal(
         state["diagnostic_report"], state.get("user_request", ""), state.get("retry_context", "")
     )
@@ -283,12 +243,6 @@ def propose_remediation_node(state: AgentState) -> Dict[str, Any]:
 
 @_timed_node("apply_remediation")
 def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Remediation model node (Apply Fix).
-    Executes the proposed fix after getting user approval - unless REQUIRE_APPROVAL=false, in
-    which case there's no external approval step to check (the graph never paused before this
-    node - see REQUIRE_APPROVAL/compiled_graph below), so it proceeds unconditionally.
-    """
     if REQUIRE_APPROVAL and state.get("approval_status") != "approved":
         return {
             "messages": [AIMessage(content="Remediation was not approved. Skipping fix execution.")],
@@ -437,13 +391,6 @@ def apply_remediation_node(state: AgentState) -> Dict[str, Any]:
 
 @_timed_node("verify_remediation")
 def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
-    """
-    Nova Pro model node (Verify).
-    Re-inspects the cluster after a fix has been applied to confirm the user's original
-    goal was actually achieved, rather than trusting that a successful tool call means the
-    underlying problem is resolved (e.g. a pod can be restarted successfully via the API
-    and still immediately crash-loop again).
-    """
     fix_result = state.get("fix_result", "")
     if fix_result.startswith("BLOCKED"):
         return {
@@ -556,20 +503,9 @@ def verify_remediation_node(state: AgentState) -> Dict[str, Any]:
     }
 
 def select_issues_node(state: AgentState) -> Dict[str, Any]:
-    """
-    No-op passthrough - exists purely to give interrupt_before a node name to pause on when
-    diagnose_node found multiple distinct issues. main.py's /api/select-issues endpoint does the
-    actual work (narrowing diagnostic_report to just what the human picked) via update_state
-    before resuming past this node, same pattern as the existing approval/retry pauses.
-    """
     return {}
 
 def route_after_diagnose(state: AgentState) -> str:
-    """
-    Routes to remediation proposal if remediation is flagged as YES, otherwise finishes - via a
-    selection detour first when diagnose_node found more than one distinct issue (single/no-issue
-    reports skip straight to propose_remediation exactly as before, no extra step added).
-    """
     if not state.get("remediation_needed"):
         return END
     if len(state.get("issues", []) or []) > 1:
@@ -577,10 +513,6 @@ def route_after_diagnose(state: AgentState) -> str:
     return "propose_remediation"
 
 def route_after_verify(state: AgentState) -> str:
-    """
-    Loops back to propose a new fix if the goal wasn't achieved and attempts remain,
-    otherwise finishes.
-    """
     if state.get("goal_achieved"):
         REMEDIATION_OUTCOMES.labels(outcome="succeeded").inc()
         return END

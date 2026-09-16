@@ -1,11 +1,5 @@
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;450;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
 
-/* ===========================================================================
-   Tokens.
-   Colour carries status, never brand. Every value is defined once per theme,
-   and no component hardcodes a colour - so the toggle restyles everything.
-   =========================================================================== */
-
 :root {
   --sans: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
   --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -121,14 +115,8 @@ body {
   }
 }
 
-/* ===========================================================================
-   Shell
-   =========================================================================== */
-
 .app-container {
   display: grid;
-  /* Wide enough that a usage row ("diagnostics   61,905 tok") stays on one line
-     instead of wrapping the value onto its own row. */
   grid-template-columns: 280px 1fr;
   height: 100vh;
 }
@@ -176,7 +164,7 @@ body {
   font-size: 12px;
   color: var(--ink-dim);
   padding: 4px 0;
-  white-space: nowrap;   /* key and value stay on one row */
+  white-space: nowrap;
 }
 
 .usage-line > span:last-child { color: var(--ink); }
@@ -211,10 +199,6 @@ body {
   height: 100vh;
 }
 
-/* ===========================================================================
-   Opening state - the composer sits centred until the first message
-   =========================================================================== */
-
 .hero {
   flex: 1;
   display: flex;
@@ -244,10 +228,6 @@ body {
   border-radius: 14px;
   box-shadow: var(--shadow-lg);
 }
-
-/* ===========================================================================
-   Conversation
-   =========================================================================== */
 
 .chat-messages {
   flex: 1;
@@ -299,10 +279,6 @@ body {
 
 .goal-badge.achieved     { color: var(--ready);  background: var(--ready-bg);  border-color: var(--ready); }
 .goal-badge.not-achieved { color: var(--failed); background: var(--failed-bg); border-color: var(--failed); }
-
-/* ===========================================================================
-   Markdown - cluster data monospace, prose sans
-   =========================================================================== */
 
 .markdown-body { font-size: 15px; }
 .markdown-body > *:first-child { margin-top: 0; }
@@ -358,10 +334,6 @@ body {
 }
 
 .markdown-body th { background: var(--surface-sunk); font-weight: 600; }
-
-/* ===========================================================================
-   The decision - the one element carrying real weight
-   =========================================================================== */
 
 .decision-panel,
 .issue-select-panel {
@@ -475,10 +447,6 @@ body {
 .issue-checkbox-row:last-of-type { border-bottom: none; margin-bottom: 8px; }
 .issue-checkbox-row input { margin-top: 4px; accent-color: var(--accent); cursor: pointer; flex-shrink: 0; }
 
-/* ===========================================================================
-   Working state
-   =========================================================================== */
-
 .status-dot {
   width: 7px;
   height: 7px;
@@ -521,10 +489,6 @@ body {
 }
 
 .cancel-btn:hover { color: var(--failed); border-color: var(--failed); }
-
-/* ===========================================================================
-   Composer - shared between the centred opening state and the docked bar
-   =========================================================================== */
 
 .chat-input-container {
   padding: 15px 22px 20px;
@@ -592,10 +556,6 @@ body {
 .chat-send-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 
 .hero .chat-send-btn { height: 58px; border-radius: 14px; box-shadow: var(--shadow-md); }
-
-/* ===========================================================================
-   Responsive
-   =========================================================================== */
 
 @media (max-width: 860px) {
   .app-container { grid-template-columns: 1fr; height: auto; min-height: 100vh; }

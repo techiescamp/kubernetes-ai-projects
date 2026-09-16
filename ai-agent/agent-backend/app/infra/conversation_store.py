@@ -1,15 +1,3 @@
-"""
-Durable conversation history.
-
-This used to be a module-level in-process list (`ConversationMemory` in main.py). With 2 backend
-replicas that meant each pod remembered a different half of the conversation and whichever pod
-handled your next request decided what "we" had talked about - and everything was lost on restart.
-So "what was the last troubleshooting we did" could legitimately have no answer on the pod that
-served it. History now lives in the same Postgres the LangGraph checkpointer already uses, so both
-replicas read the same record and it survives restarts.
-
-Falls back to an in-process list when DATABASE_URL is unset (local dev), matching checkpointer.py.
-"""
 import logging
 import os
 from typing import List
@@ -19,7 +7,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 logger = logging.getLogger(__name__)
 
 MAX_TURNS = int(os.getenv("CONVERSATION_HISTORY_TURNS", "20"))
-
 
 class _InMemoryStore:
     def __init__(self):
@@ -31,7 +18,6 @@ class _InMemoryStore:
     def save(self, user_text: str, assistant_text: str) -> None:
         self._messages.append(HumanMessage(content=user_text))
         self._messages.append(AIMessage(content=assistant_text))
-
 
 class _PostgresStore:
     def __init__(self, pool):
@@ -68,9 +54,7 @@ class _PostgresStore:
                 ("user", user_text, "assistant", assistant_text),
             )
 
-
 class ConversationStore:
-    """Thin wrapper so main.py doesn't care which backing store is in use."""
 
     def __init__(self):
         database_url = os.getenv("DATABASE_URL")

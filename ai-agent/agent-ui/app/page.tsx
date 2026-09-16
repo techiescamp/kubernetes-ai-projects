@@ -31,9 +31,6 @@ interface UsageData {
 
 type Phase = "idle" | "busy" | "awaiting_decision" | "awaiting_retry" | "awaiting_issue_selection";
 
-// Relative paths only - proxied server-side to the real backend by the rewrite in
-// next.config.ts, so this works from the browser regardless of how the frontend itself was
-// reached (port-forward, LoadBalancer, Ingress - the origin doesn't matter).
 const backendUrl = "";
 
 export default function Home() {
@@ -51,10 +48,8 @@ export default function Home() {
   const [theme, setTheme] = useState<"light" | "dark">("dark");
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  // Lets the Cancel button abort the in-flight request and hand the UI back to the user.
   const abortRef = useRef<AbortController | null>(null);
 
-  // Live elapsed-seconds counter, shown next to the ETA while a step is running.
   useEffect(() => {
     if (phase !== "busy") {
       setElapsed(0);
@@ -99,7 +94,6 @@ export default function Home() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, phase]);
 
-  // Restore the saved theme, falling back to the OS preference on first visit.
   useEffect(() => {
     const saved = localStorage.getItem("kubecheck-theme");
     if (saved === "light" || saved === "dark") {
@@ -109,8 +103,6 @@ export default function Home() {
     }
   }, []);
 
-  // Everything is driven off tokens scoped to [data-theme], so setting this one
-  // attribute restyles the whole interface.
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem("kubecheck-theme", theme);
@@ -131,10 +123,6 @@ export default function Home() {
     setInput("");
     addMessage({ role: "user", text: query });
 
-    // Multi-task: a new question while an earlier fix is still awaiting your decision simply
-    // abandons that pending proposal and starts fresh, instead of the input staying locked until
-    // you approve or reject it. Nothing was applied for the abandoned one - it only ever paused
-    // before the write step.
     if (sessionId && (phase === "awaiting_decision" || phase === "awaiting_retry" || phase === "awaiting_issue_selection")) {
       addMessage({
         role: "ai",
@@ -178,8 +166,6 @@ export default function Home() {
       }
 
       if (data.auto_approved) {
-        // REQUIRE_APPROVAL=false on the backend - the fix already ran (and was verified) with no
-        // approval step, so there's no session to act on - show the complete outcome directly.
         addMessage({
           role: "ai",
           text: data.goal_achieved
@@ -200,7 +186,7 @@ export default function Home() {
       setPhase("awaiting_decision");
       fetchUsage();
     } catch (err) {
-      if ((err as Error)?.name === "AbortError") return; // handleCancel already reported it
+      if ((err as Error)?.name === "AbortError") return;
       console.error(err);
       addMessage({
         role: "ai",
@@ -235,13 +221,6 @@ export default function Home() {
         return;
       }
 
-      // Lead with the VERIFIED outcome, not the intermediate "actions were applied" step - that
-      // read like a success banner while the real answer sat underneath it. What actually changed
-      // goes below, as supporting detail.
-      // On success the verification sentence already states what changed, so the raw tool-call
-      // list is redundant noise (and included failed-but-harmless detours like a 404 or a 409 on
-      // an existing namespace, which look alarming next to a "Fixed" heading). Only show what was
-      // tried when it did NOT work, where it's the useful part.
       const resultText = data.goal_achieved
         ? `### Fixed\n\n${data.verification}`
         : `### Not fixed\n\n${data.verification}\n\n**What was tried**\n\n${data.fix_result}`;
@@ -255,7 +234,6 @@ export default function Home() {
         setSessionId(null);
         setPhase("idle");
       } else {
-        // retry_available
         addMessage({ role: "ai", text: resultText, goalBadge: "not-achieved" });
         setPhase("awaiting_retry");
       }
@@ -382,8 +360,6 @@ export default function Home() {
     });
   };
 
-  // Before the first message the composer sits centred under a greeting; once the conversation
-  // starts it docks to the bottom. Same form either way - only its container changes.
   const hasStarted = messages.length > 0 || phase === "busy";
 
   const composer = (
@@ -393,13 +369,10 @@ export default function Home() {
           value={input}
           onChange={(e) => {
             setInput(e.target.value);
-            // Grow to fit the typed lines, capped by max-height in CSS.
             e.target.style.height = "auto";
             e.target.style.height = `${Math.min(e.target.scrollHeight, 180)}px`;
           }}
           onKeyDown={(e) => {
-            // Enter sends, Shift+Enter inserts a newline - so multi-line input (a YAML
-            // snippet, a multi-step request) can be typed without submitting halfway through.
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               handleSend(e);
@@ -414,8 +387,6 @@ export default function Home() {
                 : "Describe the problem, or ask about the cluster…"
           }
           className="chat-input"
-          // Only locked while a request is actually in flight. A pending approval no longer
-          // blocks you from asking something else - sending a new query drops that proposal.
           disabled={phase === "busy"}
         />
         <button type="submit" disabled={phase === "busy" || !input.trim()} className="chat-send-btn">

@@ -37,8 +37,8 @@ Skip this if you are using the prebuilt `devopscube/*` images.
 export REGISTRY=docker.io/<your-username>
 export TAG=v1.0.0
 
-docker build -t $REGISTRY/ai-agent-backend:$TAG  backend/
-docker build -t $REGISTRY/ai-agent-frontend:$TAG frontend/
+docker build -t $REGISTRY/ai-agent-backend:$TAG  agent-backend/
+docker build -t $REGISTRY/ai-agent-frontend:$TAG agent-ui/
 docker push $REGISTRY/ai-agent-backend:$TAG
 docker push $REGISTRY/ai-agent-frontend:$TAG
 ```
