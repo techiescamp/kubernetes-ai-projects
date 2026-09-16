@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-agent-backend
+  namespace: ai-agent
+  labels: {app: ai-agent-backend}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: ai-agent-backend}
+  template:
+    metadata:
+      labels: {app: ai-agent-backend}
+    spec:
+      serviceAccountName: ai-agent
+      terminationGracePeriodSeconds: 30
+      imagePullSecrets:
+        - name: ai-agent-registry
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: backend
+          image: docker.io/devopscube/ai-agent-backend:v1.4.4
+          ports:
+            - containerPort: 8000
+          env:
+            - name: AWS_REGION
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: AWS_REGION}}
+            - name: DIAGNOSTICS_MODEL_ID
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: DIAGNOSTICS_MODEL_ID}}
+            - name: REMEDIATION_MODEL_ID
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: REMEDIATION_MODEL_ID}}
+            - name: LOG_LEVEL
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: LOG_LEVEL}}
+            - name: MAX_REMEDIATION_ATTEMPTS
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: MAX_REMEDIATION_ATTEMPTS}}
+            - name: REQUIRE_APPROVAL
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: REQUIRE_APPROVAL}}
+            - name: ALLOWED_ORIGINS
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: ALLOWED_ORIGINS}}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: ai-agent-secrets, key: AWS_ACCESS_KEY_ID, optional: true}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: ai-agent-secrets, key: AWS_SECRET_ACCESS_KEY, optional: true}}
+            - name: DIAGNOSTICS_MODEL_PRICE_INPUT_PER_1K
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: DIAGNOSTICS_MODEL_PRICE_INPUT_PER_1K, optional: true}}
+            - name: DIAGNOSTICS_MODEL_PRICE_OUTPUT_PER_1K
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: DIAGNOSTICS_MODEL_PRICE_OUTPUT_PER_1K, optional: true}}
+            - name: REMEDIATION_MODEL_PRICE_INPUT_PER_1K
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: REMEDIATION_MODEL_PRICE_INPUT_PER_1K, optional: true}}
+            - name: REMEDIATION_MODEL_PRICE_OUTPUT_PER_1K
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: REMEDIATION_MODEL_PRICE_OUTPUT_PER_1K, optional: true}}
+            - name: DATABASE_USER
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: DATABASE_USER}}
+            - name: DATABASE_HOST
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: DATABASE_HOST}}
+            - name: DATABASE_PORT
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: DATABASE_PORT}}
+            - name: DATABASE_NAME
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: DATABASE_NAME}}
+            - name: DATABASE_PASSWORD
+              valueFrom: {secretKeyRef: {name: ai-agent-secrets, key: DATABASE_PASSWORD}}
+            - name: DATABASE_URL
+              value: "postgresql://$(DATABASE_USER):$(DATABASE_PASSWORD)@$(DATABASE_HOST):$(DATABASE_PORT)/$(DATABASE_NAME)"
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8000}
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: {path: /readyz, port: 8000}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec: {command: ["sleep", "5"]}
+      volumes:
+        - name: tmp
+          emptyDir: {}

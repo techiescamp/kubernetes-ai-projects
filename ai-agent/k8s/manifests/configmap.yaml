@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-agent-config
+  namespace: ai-agent
+data:
+  ALLOWED_ORIGINS: "http://(localhost|127\\.0\\.0\\.1):\\d+|http://ai-agent-frontend(\\.ai-agent)?(\\.svc)?(\\.cluster\\.local)?:\\d+"
+  DATABASE_HOST: "ai-agent-postgres"
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: "ai_agent"
+  DATABASE_USER: "ai_agent"
+  BACKEND_URL: "http://ai-agent-backend:8000"

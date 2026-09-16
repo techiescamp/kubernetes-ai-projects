@@ -1,0 +1,58 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ai-agent
+
+resources:
+  - manifests/namespace.yaml
+  - manifests/serviceaccount.yaml
+  - manifests/rbac.yaml
+  - manifests/configmap.yaml
+  - manifests/postgres.yaml
+  - manifests/backend-deployment.yaml
+  - manifests/backend-service.yaml
+  - manifests/frontend-deployment.yaml
+  - manifests/frontend-service.yaml
+  - manifests/networkpolicy.yaml
+#  - manifests/ingress.yaml
+#  - manifests/servicemonitor.yaml
+
+images:
+  - name: docker.io/devopscube/ai-agent-backend
+    newTag: v1.7.1
+  - name: docker.io/devopscube/ai-agent-frontend
+    newTag: v1.8.2
+
+replicas:
+  - name: ai-agent-backend
+    count: 1
+  - name: ai-agent-frontend
+    count: 1
+
+configMapGenerator:
+  - name: ai-agent-config
+    namespace: ai-agent
+    behavior: merge
+    literals:
+      - AWS_REGION=us-west-2
+      - DIAGNOSTICS_MODEL_ID=us.amazon.nova-pro-v1:0
+      - REMEDIATION_MODEL_ID=us.amazon.nova-pro-v1:0
+      - LOG_LEVEL=INFO
+      - MAX_REMEDIATION_ATTEMPTS=3
+      - REQUIRE_APPROVAL=true
+      - DIAGNOSTICS_MODEL_PRICE_INPUT_PER_1K=0.0008
+      - DIAGNOSTICS_MODEL_PRICE_OUTPUT_PER_1K=0.0032
+      - REMEDIATION_MODEL_PRICE_INPUT_PER_1K=0.0008
+      - REMEDIATION_MODEL_PRICE_OUTPUT_PER_1K=0.0032
+
+secretGenerator:
+  - name: ai-agent-secrets
+    namespace: ai-agent
+    literals:
+      - DATABASE_PASSWORD=changeme
+#      - AWS_ACCESS_KEY_ID=your-access-key-id
+#      - AWS_SECRET_ACCESS_KEY=your-secret-access-key
+  - name: ai-agent-postgres-secrets
+    namespace: ai-agent
+    literals:
+      - POSTGRES_PASSWORD=changeme

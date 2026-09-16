@@ -1,0 +1,15 @@
+# Verified via a real `docker build` (2026-09-11) - these pins install cleanly together and the
+# full app (agents.py -> main.py, all modules) imports successfully against the resulting
+# langchain-core==0.3.86. Re-verify with a fresh build if any of these are bumped.
+langgraph==0.6.6
+langchain==0.3.27
+langchain-aws==0.2.32
+langchain-community==0.3.30
+kubernetes==31.0.0
+boto3==1.40.11
+python-dotenv==1.1.1
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+langgraph-checkpoint-postgres==2.0.21
+psycopg[binary]==3.2.3
+prometheus-client==0.21.1
