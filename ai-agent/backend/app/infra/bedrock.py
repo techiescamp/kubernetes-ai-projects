@@ -1,7 +1,7 @@
 import os
 import boto3
 from dotenv import load_dotenv
-from langchain_aws import ChatBedrock, ChatBedrockConverse
+from langchain_aws import ChatBedrockConverse
 
 load_dotenv()
 
@@ -17,12 +17,17 @@ bedrock_client = session.client(
 
 def get_diagnostics_model():
     """
-    Returns ChatBedrock instance for the diagnostics model using resolved boto3 credentials.
+    Returns a ChatBedrockConverse instance for the diagnostics model using resolved boto3
+    credentials. Uses the native Bedrock Converse API - diagnose_node and verify_remediation_node
+    both call .bind_tools() on this (24 read tools), and Converse is what gives reliable tool
+    calling regardless of which model DIAGNOSTICS_MODEL_ID points at (same reasoning as
+    get_remediation_model below; this used to be the older ChatBedrock/invoke_model wrapper, which
+    had no documented reason to differ from remediation on this point).
     """
-    return ChatBedrock(
+    return ChatBedrockConverse(
         client=bedrock_client,
         model_id=DIAGNOSTICS_MODEL_ID,
-        model_kwargs={"temperature": 0.0}
+        temperature=0.0,
     )
 
 def get_remediation_model():
