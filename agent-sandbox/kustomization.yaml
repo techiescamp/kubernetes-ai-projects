@@ -4,30 +4,24 @@ kind: Kustomization
 namespace: ai-agent
 
 resources:
-  - manifests/namespace.yaml
-  - manifests/serviceaccount.yaml
-  - manifests/rbac.yaml
-  - manifests/configmap.yaml
-  - manifests/postgres.yaml
-  - manifests/backend-deployment.yaml
-  - manifests/backend-service.yaml
-  - manifests/frontend-deployment.yaml
-  - manifests/frontend-service.yaml
-  - manifests/networkpolicy.yaml
-#  - manifests/ingress.yaml
-#  - manifests/servicemonitor.yaml
+  - manifests/00-namespace.yaml
+  - manifests/01-serviceaccount.yaml
+  - manifests/02-rbac.yaml
+  - manifests/03-configmap.yaml
+  - manifests/04-postgres.yaml
+  - manifests/05-backend-template.yaml
+  - manifests/06-backend-warmpool.yaml
+  - manifests/07-backend-claim.yaml
+  - manifests/08-backend-service.yaml
+  - manifests/09-frontend-deployment.yaml
+  - manifests/10-frontend-service.yaml
+  - manifests/11-networkpolicy.yaml
 
 images:
   - name: docker.io/devopscube/ai-agent-backend
     newTag: v1.7.1
   - name: docker.io/devopscube/ai-agent-frontend
     newTag: v1.8.2
-
-replicas:
-  - name: ai-agent-backend
-    count: 1
-  - name: ai-agent-frontend
-    count: 1
 
 configMapGenerator:
   - name: ai-agent-config
@@ -51,10 +45,8 @@ secretGenerator:
     options:
       disableNameSuffixHash: true
     literals:
-      - DATABASE_PASSWORD=changeme
-#      - AWS_ACCESS_KEY_ID=your-access-key-id
-#      - AWS_SECRET_ACCESS_KEY=your-secret-access-key
+      - DATABASE_PASSWORD=x79BQgd2HJ16qYe0c0MaT106
   - name: ai-agent-postgres-secrets
     namespace: ai-agent
     literals:
-      - POSTGRES_PASSWORD=changeme
+      - POSTGRES_PASSWORD=x79BQgd2HJ16qYe0c0MaT106

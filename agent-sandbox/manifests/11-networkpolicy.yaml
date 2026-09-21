@@ -1,0 +1,55 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-agent-backend
+  namespace: ai-agent
+spec:
+  podSelector:
+    matchLabels: {sandbox.users.io/role: backend}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: ai-agent-frontend}}
+      ports:
+        - {port: 8000, protocol: TCP}
+  egress:
+    - ports: [{port: 443, protocol: TCP}]
+    - to:
+        - podSelector: {matchLabels: {app: ai-agent-postgres}}
+      ports: [{port: 5432, protocol: TCP}]
+    - ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-agent-frontend
+  namespace: ai-agent
+spec:
+  podSelector:
+    matchLabels: {app: ai-agent-frontend}
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - {}
+  egress:
+    - to:
+        - podSelector: {matchLabels: {sandbox.users.io/role: backend}}
+      ports: [{port: 8000, protocol: TCP}]
+    - ports:
+        - {port: 53, protocol: UDP}
+        - {port: 53, protocol: TCP}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-agent-postgres
+  namespace: ai-agent
+spec:
+  podSelector:
+    matchLabels: {app: ai-agent-postgres}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {sandbox.users.io/role: backend}}
+      ports: [{port: 5432, protocol: TCP}]

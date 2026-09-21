@@ -1,0 +1,20 @@
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxClaim
+metadata:
+  name: ai-agent-backend-claim
+  namespace: ai-agent
+spec:
+  warmPoolRef:
+    name: ai-agent-backend-pool
+  # The template's podTemplate deliberately has no "app" label, so idle pool spares don't carry
+  # one and can't be matched by 08-backend-service.yaml's selector - this stamps a label ONLY on
+  # the instance actually claimed and in service. Without it, the pool's standing spare(s) get
+  # load-balanced traffic alongside the claimed instance (confirmed live: the Service had 2
+  # endpoints instead of 1). additionalPodMetadata labels must carry a domain prefix from an
+  # allowlist the controller enforces (agent-sandbox-config ConfigMap, key allowed-label-domains)
+  # - a bare "app" key is rejected outright, and an arbitrary self-chosen domain is rejected too
+  # unless it's on that list. sandbox.users.io is the controller's own default allowed domain, so
+  # it's used here rather than adding a custom one to the cluster-wide allowlist.
+  additionalPodMetadata:
+    labels:
+      sandbox.users.io/role: backend

@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-agent-frontend
+  namespace: ai-agent
+  labels: {app: ai-agent-frontend}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: ai-agent-frontend}
+  template:
+    metadata:
+      labels: {app: ai-agent-frontend}
+    spec:
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: frontend
+          image: docker.io/devopscube/ai-agent-frontend:v1.8.2
+          ports:
+            - containerPort: 3000
+          env:
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            - name: BACKEND_URL
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: BACKEND_URL}}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          readinessProbe:
+            httpGet: {path: /, port: 3000}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /, port: 3000}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      volumes:
+        - name: tmp
+          emptyDir: {}

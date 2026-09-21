@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-agent-postgres
+  namespace: ai-agent
+  labels: {app: ai-agent-postgres}
+spec:
+  clusterIP: None
+  selector: {app: ai-agent-postgres}
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ai-agent-postgres
+  namespace: ai-agent
+spec:
+  serviceName: ai-agent-postgres
+  replicas: 1
+  selector:
+    matchLabels: {app: ai-agent-postgres}
+  template:
+    metadata:
+      labels: {app: ai-agent-postgres}
+    spec:
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: DATABASE_USER}}
+            - name: POSTGRES_DB
+              valueFrom: {configMapKeyRef: {name: ai-agent-config, key: DATABASE_NAME}}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: ai-agent-postgres-secrets, key: POSTGRES_PASSWORD}}
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+          readinessProbe:
+            exec: {command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\""]}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec: {command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\""]}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
