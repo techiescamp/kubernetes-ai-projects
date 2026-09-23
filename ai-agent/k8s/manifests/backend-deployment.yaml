@@ -14,8 +14,6 @@ spec:
     spec:
       serviceAccountName: ai-agent
       terminationGracePeriodSeconds: 30
-      imagePullSecrets:
-        - name: ai-agent-registry
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -23,7 +21,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: backend
-          image: docker.io/devopscube/ai-agent-backend:v1.4.4
+          image: docker.io/devopscube/ai-agent-backend:v1.7.1
           ports:
             - containerPort: 8000
           env:
