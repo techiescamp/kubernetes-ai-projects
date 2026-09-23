@@ -1,18 +1,17 @@
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
 metadata:
-  name: ai-agent-backend
+  name: ai-agent-backend-template
   namespace: ai-agent
-  labels: {app: ai-agent-backend}
 spec:
-  replicas: 1
-  selector:
-    matchLabels: {app: ai-agent-backend}
-  template:
-    metadata:
-      labels: {app: ai-agent-backend}
+  service: false
+  podTemplate:
     spec:
       serviceAccountName: ai-agent
+      automountServiceAccountToken: true
+      dnsPolicy: ClusterFirst
+      runtimeClassName: gvisor
+      nodeSelector: {sandbox: gvisor}
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -39,10 +38,6 @@ spec:
               valueFrom: {configMapKeyRef: {name: ai-agent-config, key: REQUIRE_APPROVAL}}
             - name: ALLOWED_ORIGINS
               valueFrom: {configMapKeyRef: {name: ai-agent-config, key: ALLOWED_ORIGINS}}
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom: {secretKeyRef: {name: ai-agent-secrets, key: AWS_ACCESS_KEY_ID, optional: true}}
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom: {secretKeyRef: {name: ai-agent-secrets, key: AWS_SECRET_ACCESS_KEY, optional: true}}
             - name: DIAGNOSTICS_MODEL_PRICE_INPUT_PER_1K
               valueFrom: {configMapKeyRef: {name: ai-agent-config, key: DIAGNOSTICS_MODEL_PRICE_INPUT_PER_1K, optional: true}}
             - name: DIAGNOSTICS_MODEL_PRICE_OUTPUT_PER_1K

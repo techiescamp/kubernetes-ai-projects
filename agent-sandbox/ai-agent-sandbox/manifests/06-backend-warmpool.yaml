@@ -1,8 +1,9 @@
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxWarmPool
 metadata:
-  name: k8sgpt-warmpool
+  name: ai-agent-backend-pool
+  namespace: ai-agent
 spec:
-  replicas: 2
+  replicas: 1
   sandboxTemplateRef:
-    name: k8sgpt-diagnostic-template
+    name: ai-agent-backend-template
