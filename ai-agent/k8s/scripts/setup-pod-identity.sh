@@ -71,11 +71,6 @@ create() {
       --role-arn "$ROLE_ARN" >/dev/null
     echo "association created"
   fi
-
-  echo
-  echo "Mapped $NAMESPACE/$SERVICE_ACCOUNT -> $ROLE_ARN"
-  echo "Restart the backend so it picks up the credentials:"
-  echo "  kubectl -n $NAMESPACE rollout restart deployment/ai-agent-backend"
 }
 
 cleanup() {
@@ -95,8 +90,6 @@ cleanup() {
       echo "policy $POLICY_NAME deleted"
     fi
 
-    # delete-role refuses while anything is still attached, so say which one rather
-    # than failing with a bare MalformedPolicyDocument-style error
     LEFTOVER="$(aws iam list-role-policies --role-name "$ROLE_NAME" --query 'PolicyNames' --output text)"
     ATTACHED="$(aws iam list-attached-role-policies --role-name "$ROLE_NAME" --query 'AttachedPolicies[].PolicyName' --output text)"
     if [ -n "$LEFTOVER" ] || [ -n "$ATTACHED" ]; then

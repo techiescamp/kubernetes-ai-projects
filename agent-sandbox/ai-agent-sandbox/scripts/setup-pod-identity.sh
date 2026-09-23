@@ -71,11 +71,6 @@ create() {
       --role-arn "$ROLE_ARN" >/dev/null
     echo "association created"
   fi
-
-  echo
-  echo "Mapped $NAMESPACE/$SERVICE_ACCOUNT -> $ROLE_ARN"
-  echo "The backend Sandbox picks this up on creation - if it's already running, recreate it:"
-  echo "  kubectl -n $NAMESPACE delete sandbox ai-agent-backend && kubectl apply -f 06-backend-sandbox.yaml"
 }
 
 cleanup() {
