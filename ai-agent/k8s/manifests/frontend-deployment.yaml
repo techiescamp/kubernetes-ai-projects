@@ -13,15 +13,13 @@ spec:
       labels: {app: ai-agent-frontend}
     spec:
       terminationGracePeriodSeconds: 15
-      imagePullSecrets:
-        - name: ai-agent-registry
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: frontend
-          image: docker.io/devopscube/ai-agent-frontend:v1.7.1
+          image: docker.io/devopscube/ai-agent-frontend:v1.8.2
           ports:
             - containerPort: 3000
           env:
