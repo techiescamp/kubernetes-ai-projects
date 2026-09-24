@@ -4,6 +4,6 @@ metadata:
   name: ai-agent-backend-pool
   namespace: ai-agent
 spec:
-  replicas: 1
+  replicas: 2
   sandboxTemplateRef:
     name: ai-agent-backend-template

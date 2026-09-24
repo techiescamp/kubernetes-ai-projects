@@ -1,0 +1,26 @@
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: python-runtime-template
+  namespace: default
+spec:
+  service: false
+  podTemplate:
+    spec:
+      runtimeClassName: gvisor
+      nodeSelector: {sandbox: gvisor}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: python-runtime
+          image: registry.k8s.io/agent-sandbox/python-runtime-sandbox:v0.1.0
+          ports:
+            - containerPort: 8888
+          securityContext:
+            capabilities: {drop: ["ALL"]}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: 500m, memory: 1Gi}
