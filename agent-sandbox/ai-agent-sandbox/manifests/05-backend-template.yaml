@@ -7,11 +7,10 @@ spec:
   service: false
   podTemplate:
     spec:
+      runtimeClassName: gvisor
       serviceAccountName: ai-agent
       automountServiceAccountToken: true
       dnsPolicy: ClusterFirst
-      runtimeClassName: gvisor
-      nodeSelector: {sandbox: gvisor}
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true

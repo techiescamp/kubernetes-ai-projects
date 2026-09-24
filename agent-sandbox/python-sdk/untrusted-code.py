@@ -1,58 +1,123 @@
-"""
-Secure isolation use case: an agent lets an LLM decide what code to run,
-and that code might be malicious - by accident (a hallucinated action) or
-on purpose (a manipulated/jailbroken prompt). This runs three real attacks
-a compromised script might attempt, then runs a fourth check whose result
-can only be seen by inspecting the cluster node directly - see
-../README.md for how to do that and what it proves.
-"""
+import os
 
 from k8s_agent_sandbox import SandboxClient
-from k8s_agent_sandbox.models import SandboxInClusterConnectionConfig
+from k8s_agent_sandbox.models import SandboxDirectConnectionConfig
 
-GENERATED_CODE = """
+
+ROUTER_URL = os.getenv("ROUTER_URL", "http://127.0.0.1:8080")
+ROUTER_AUTH_TOKEN = os.getenv("ROUTER_AUTH_TOKEN")
+
+
+GENERATED_CODE = r"""
 import os
-import time
+import subprocess
+import sys
 
-def attempt(label, fn):
+
+TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+PROBE_NAME = "sandbox-isolation-probe-8f2e1c"
+
+
+def attempt(label, function):
     try:
-        result = fn()
-        print(f"[{label}] NOT BLOCKED: {result!r}")
-    except Exception as e:
-        print(f"[{label}] blocked: {type(e).__name__}: {e}")
+        function()
+        print(f"[{label}] NOT BLOCKED")
+    except Exception as error:
+        print(f"[{label}] blocked: {type(error).__name__}: {error}")
 
-attempt("read /etc/shadow", lambda: open("/etc/shadow").read())
 
-attempt("setuid(0)", lambda: os.setuid(0))
+def read_one_byte(path):
+    with open(path, "rb") as file:
+        file.read(1)
 
-def steal_sa_token():
-    with open("/var/run/secrets/kubernetes.io/serviceaccount/token") as f:
-        return f.read()
-attempt("steal ServiceAccount token", steal_sa_token)
 
-print("sandbox-isolation-probe-8f2e1c: running for 45s, check the node now")
-time.sleep(45)
-print("sandbox-isolation-probe-8f2e1c: done")
+attempt(
+    "read /etc/shadow",
+    lambda: read_one_byte("/etc/shadow"),
+)
+
+attempt(
+    "setuid(0)",
+    lambda: os.setuid(0),
+)
+
+attempt(
+    "read ServiceAccount token",
+    lambda: read_one_byte(TOKEN_PATH),
+)
+
+
+print("\n--- Host process visibility check ---")
+print(f"Starting {PROBE_NAME} for 45 seconds")
+
+probe_command = [
+    sys.executable,
+    "-c",
+    "import time; time.sleep(45)",
+    PROBE_NAME,
+]
+
+probe = subprocess.Popen(probe_command)
+
+print(f"Probe PID inside sandbox: {probe.pid}")
+probe.wait(timeout=50)
+
+print("Host process visibility check completed")
 """
 
 
-def main() -> None:
-    client = SandboxClient(connection_config=SandboxInClusterConnectionConfig())
+def main():
+    config = SandboxDirectConnectionConfig(api_url=ROUTER_URL)
+    client = SandboxClient(connection_config=config)
+
+    print("Claiming a sandbox from python-sandbox-warmpool...")
+
     sandbox = client.create_sandbox(
         warmpool="python-sandbox-warmpool",
         namespace="default",
     )
 
     try:
-        sandbox.files.write("attack_attempt.py", GENERATED_CODE)
-        result = sandbox.commands.run("python3 attack_attempt.py", timeout=60)
+        if ROUTER_AUTH_TOKEN:
+            sandbox.connector.session.headers.update({
+                "Authorization": f"Bearer {ROUTER_AUTH_TOKEN}"
+            })
 
+        pod_name = sandbox.get_pod_name()
+
+        print(f"Claim:   {sandbox.claim_name}")
+        print(f"Sandbox: {sandbox.sandbox_id}")
+        print(f"Pod:     {pod_name}")
+
+        sandbox.files.write(
+            "attack_attempt.py",
+            GENERATED_CODE,
+        )
+
+        print("\nStarting the 45-second isolation test.")
+        print(
+            "On the node, run:\n"
+            "sudo ps -eo pid,args | "
+            "grep '[s]andbox-isolation-probe-8f2e1c'",
+            flush=True,
+        )
+
+        result = sandbox.commands.run(
+            "python3 attack_attempt.py",
+            timeout=90,
+        )
+
+        print("\n--- stdout ---")
         print(result.stdout)
+
         if result.stderr:
             print("--- stderr ---")
             print(result.stderr)
+
         print(f"exit_code={result.exit_code}")
+
     finally:
+        print("Terminating the sandbox claim...")
         sandbox.terminate()
 
 
