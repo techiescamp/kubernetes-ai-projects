@@ -1,4 +1,4 @@
-# AIOps for DevOps Engineers
+# K8s Diagnose & Remediate Agent  
 
 A LangGraph multi-agent that diagnoses and (with human approval) remediates Kubernetes problems
 using AWS Bedrock (Amazon Nova Pro for both diagnostics/verification and remediation - see
@@ -38,6 +38,23 @@ to diagnose/remediate, and AWS credentials with `bedrock:InvokeModel` for the tw
 See [`k8s/README.md`](k8s/README.md) for prerequisites, Dockerfiles, manifests (Deployment,
 Service, RBAC, NetworkPolicy, Postgres-backed durable memory, health probes), and a phased
 step-by-step deploy guide.
+
+## API endpoints
+
+All served by the FastAPI backend (`agent-backend/app/main.py`):
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/health` | Basic health check |
+| GET | `/healthz` | Liveness probe (also reports `require_approval`) |
+| GET | `/readyz` | Readiness probe - checks Kubernetes API and Bedrock client connectivity |
+| GET | `/api/usage` | Token usage/cost tracking |
+| POST | `/api/query` | Submit a diagnosis request; starts a new agent session |
+| POST | `/api/decision` | Approve or reject a proposed fix |
+| POST | `/api/retry` | Retry remediation after a failed verification |
+| POST | `/api/select-issues` | Choose which of the diagnosed issues to remediate |
+| POST | `/api/guidance` | Give the agent human guidance before its next attempt |
+| GET | `/metrics` | Prometheus metrics (mounted sub-app) |
 
 ## Key files
 
